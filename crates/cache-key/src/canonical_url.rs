@@ -26,6 +26,15 @@ impl CanonicalUrl {
             return Self(url);
         }
 
+        // If the URL has no host, then it's not a valid URL anyway.
+        if !url.has_host() {
+            return Self(url);
+        }
+
+        // Strip credentials.
+        url.set_password(None).unwrap();
+        url.set_username("").unwrap();
+
         // Strip a trailing slash.
         if url.path().ends_with('/') {
             url.path_segments_mut().unwrap().pop_if_empty();
@@ -88,6 +97,12 @@ impl Hash for CanonicalUrl {
         // `as_str` gives the serialisation of a url (which has a spec) and so insulates against
         // possible changes in how the URL crate does hashing.
         self.0.as_str().hash(state);
+    }
+}
+
+impl From<CanonicalUrl> for Url {
+    fn from(value: CanonicalUrl) -> Self {
+        value.0
     }
 }
 
@@ -159,9 +174,65 @@ impl Deref for RepositoryUrl {
     }
 }
 
+impl std::fmt::Display for RepositoryUrl {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_credential_does_not_affect_cache_key() -> Result<(), url::ParseError> {
+        let mut hasher = CacheKeyHasher::new();
+        CanonicalUrl::parse("https://example.com/pypa/sample-namespace-packages.git@2.0.0")?
+            .cache_key(&mut hasher);
+        let hash_without_creds = hasher.finish();
+
+        let mut hasher = CacheKeyHasher::new();
+        CanonicalUrl::parse(
+            "https://user:foo@example.com/pypa/sample-namespace-packages.git@2.0.0",
+        )?
+        .cache_key(&mut hasher);
+        let hash_with_creds = hasher.finish();
+        assert_eq!(
+            hash_without_creds, hash_with_creds,
+            "URLs with no user credentials should hash the same as URLs with different user credentials",
+        );
+
+        let mut hasher = CacheKeyHasher::new();
+        CanonicalUrl::parse(
+            "https://user:bar@example.com/pypa/sample-namespace-packages.git@2.0.0",
+        )?
+        .cache_key(&mut hasher);
+        let hash_with_creds = hasher.finish();
+        assert_eq!(
+            hash_without_creds, hash_with_creds,
+            "URLs with different user credentials should hash the same",
+        );
+
+        let mut hasher = CacheKeyHasher::new();
+        CanonicalUrl::parse("https://:bar@example.com/pypa/sample-namespace-packages.git@2.0.0")?
+            .cache_key(&mut hasher);
+        let hash_with_creds = hasher.finish();
+        assert_eq!(
+            hash_without_creds, hash_with_creds,
+            "URLs with no username, though with a password, should hash the same as URLs with different user credentials",
+        );
+
+        let mut hasher = CacheKeyHasher::new();
+        CanonicalUrl::parse("https://user:@example.com/pypa/sample-namespace-packages.git@2.0.0")?
+            .cache_key(&mut hasher);
+        let hash_with_creds = hasher.finish();
+        assert_eq!(
+            hash_without_creds, hash_with_creds,
+            "URLs with no password, though with a username, should hash the same as URLs with different user credentials",
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn canonical_url() -> Result<(), url::ParseError> {

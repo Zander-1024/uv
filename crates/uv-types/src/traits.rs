@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use distribution_types::{IndexLocations, Resolution, SourceDist};
+use distribution_types::{IndexLocations, InstalledDist, Resolution, SourceDist};
 
-use pep508_rs::Requirement;
+use pep508_rs::{PackageName, Requirement};
 use uv_cache::Cache;
 use uv_interpreter::{Interpreter, PythonEnvironment};
 
-use crate::{BuildIsolation, BuildKind, NoBinary, NoBuild, SetupPyStrategy};
+use crate::BuildIsolation;
+use uv_configuration::{BuildKind, NoBinary, NoBuild, SetupPyStrategy};
 
 ///  Avoids cyclic crate dependencies between resolver, installer and builder.
 ///
@@ -94,13 +95,13 @@ pub trait BuildContext: Sync {
     ///
     /// For PEP 517 builds, this calls `get_requires_for_build_wheel`.
     ///
-    /// `package_id` is for error reporting only.
+    /// `version_id` is for error reporting only.
     /// `dist` is for safety checks and may be null for editable builds.
     fn setup_build<'a>(
         &'a self,
         source: &'a Path,
         subdirectory: Option<&'a Path>,
-        package_id: &'a str,
+        version_id: &'a str,
         dist: Option<&'a SourceDist>,
         build_kind: BuildKind,
     ) -> impl Future<Output = Result<Self::SourceDistBuilder>> + Send + 'a;
@@ -126,4 +127,23 @@ pub trait SourceBuildTrait {
     /// Returns the filename of the built wheel inside the given `wheel_dir`.
     fn wheel<'a>(&'a self, wheel_dir: &'a Path)
         -> impl Future<Output = Result<String>> + Send + 'a;
+}
+
+/// A wrapper for [`uv_installer::SitePackages`]
+pub trait InstalledPackagesProvider {
+    fn iter(&self) -> impl Iterator<Item = &InstalledDist>;
+    fn get_packages(&self, name: &PackageName) -> Vec<&InstalledDist>;
+}
+
+/// An [`InstalledPackagesProvider`] with no packages in it.
+pub struct EmptyInstalledPackages;
+
+impl InstalledPackagesProvider for EmptyInstalledPackages {
+    fn get_packages(&self, _name: &pep508_rs::PackageName) -> Vec<&InstalledDist> {
+        Vec::new()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &InstalledDist> {
+        std::iter::empty()
+    }
 }

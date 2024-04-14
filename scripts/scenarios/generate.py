@@ -4,7 +4,7 @@ Generates and updates snapshot test cases from packse scenarios.
 
 Important:
 
-    This script is the backend called by `./scripts/scenarios/sync.sh`, consider using that
+    This script is the backend called by `./scripts/sync_scenarios.sh`, consider using that
     if not developing scenarios.
 
 Requirements:
@@ -64,7 +64,6 @@ except ImportError:
         file=sys.stderr,
     )
     exit(1)
-
 
 try:
     import chevron_blue
@@ -133,6 +132,13 @@ def main(scenarios: list[Path], snapshot_update: bool = True):
             else []
         )
 
+    # Hack to track which scenarios require a specific Python patch version
+    for scenario in data["scenarios"]:
+        if "patch" in scenario["name"]:
+            scenario["python_patch"] = True
+        else:
+            scenario["python_patch"] = False
+
     # We don't yet support local versions that aren't expressed as direct dependencies.
     for scenario in data["scenarios"]:
         expected = scenario["expected"]
@@ -168,11 +174,11 @@ def main(scenarios: list[Path], snapshot_update: bool = True):
 
         # Add generated metadata
         data["generated_from"] = (
-            f"https://github.com/zanieb/packse/tree/{ref}/scenarios"
+            f"https://github.com/astral-sh/packse/tree/{ref}/scenarios"
         )
-        data["generated_with"] = "./scripts/scenarios/sync.sh"
+        data["generated_with"] = "./scripts/sync_scenarios.sh"
         data["vendor_links"] = (
-            f"https://raw.githubusercontent.com/zanieb/packse/{ref}/vendor/links.html"
+            f"https://raw.githubusercontent.com/astral-sh/packse/{ref}/vendor/links.html"
         )
 
         data["index_url"] = f"https://astral-sh.github.io/packse/{ref}/simple-html/"

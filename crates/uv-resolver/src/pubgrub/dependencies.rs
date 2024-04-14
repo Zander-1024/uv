@@ -5,10 +5,9 @@ use tracing::warn;
 use distribution_types::Verbatim;
 use pep440_rs::Version;
 use pep508_rs::{MarkerEnvironment, Requirement, VersionOrUrl};
+use uv_configuration::{Constraints, Overrides};
 use uv_normalize::{ExtraName, PackageName};
 
-use crate::constraints::Constraints;
-use crate::overrides::Overrides;
 use crate::pubgrub::specifier::PubGrubSpecifier;
 use crate::pubgrub::PubGrubPackage;
 use crate::resolver::{Locals, Urls};
@@ -178,7 +177,7 @@ fn to_pubgrub(
                 ));
             };
 
-            if !urls.is_allowed(expected, url) {
+            if !Urls::is_allowed(expected, url) {
                 return Err(ResolveError::ConflictingUrlsTransitive(
                     requirement.name.clone(),
                     expected.verbatim().to_string(),

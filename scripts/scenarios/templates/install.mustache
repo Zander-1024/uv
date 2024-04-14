@@ -1,9 +1,9 @@
 //! DO NOT EDIT
 //!
-//! Generated with {{generated_with}}
+//! Generated with `{{generated_with}}`
 //! Scenarios from <{{generated_from}}>
 //!
-#![cfg(all(feature = "python", feature = "pypi"))]
+#![cfg(all(feature = "python", feature = "pypi", unix))]
 
 use std::path::Path;
 use std::process::Command;
@@ -11,7 +11,7 @@ use std::process::Command;
 use assert_cmd::assert::Assert;
 use assert_cmd::prelude::*;
 
-use common::{venv_to_interpreter, INSTA_FILTERS};
+use common::{venv_to_interpreter};
 
 use crate::common::{get_bin, uv_snapshot, TestContext};
 
@@ -77,6 +77,9 @@ fn command(context: &TestContext) -> Command {
 /// {{.}}
 {{/tree}}
 /// ```
+{{#python_patch}}
+#[cfg(feature = "python-patch")]
+{{/python_patch}}
 #[test]
 fn {{module_name}}() {
     let context = TestContext::new("{{environment.python}}");

@@ -6,8 +6,9 @@ use pep440_rs::{Operator, Version};
 use pep508_rs::{
     MarkerEnvironment, Requirement, RequirementsTxtRequirement, UnnamedRequirement, VersionOrUrl,
 };
-use pypi_types::{HashError, Hashes};
+use pypi_types::{HashDigest, HashError};
 use requirements_txt::RequirementEntry;
+use tracing::trace;
 use uv_normalize::PackageName;
 
 #[derive(thiserror::Error, Debug)]
@@ -22,7 +23,7 @@ pub enum PreferenceError {
 #[derive(Clone, Debug)]
 pub struct Preference {
     requirement: Requirement,
-    hashes: Vec<Hashes>,
+    hashes: Vec<HashDigest>,
 }
 
 impl Preference {
@@ -39,7 +40,7 @@ impl Preference {
                 .hashes
                 .iter()
                 .map(String::as_str)
-                .map(Hashes::from_str)
+                .map(HashDigest::from_str)
                 .collect::<Result<_, _>>()?,
         })
     }
@@ -68,13 +69,20 @@ impl Preference {
 pub(crate) struct Preferences(FxHashMap<PackageName, Pin>);
 
 impl Preferences {
-    /// Create a map of pinned packages from a list of [`Preference`] entries.
-    pub(crate) fn from_requirements(
-        requirements: Vec<Preference>,
+    /// Create a map of pinned packages from an iterator of [`Preference`] entries.
+    /// Takes ownership of the [`Preference`] entries.
+    ///
+    /// The provided [`MarkerEnvironment`] will be used to filter  the preferences
+    /// to an applicable subset.
+    pub(crate) fn from_iter<PreferenceIterator: IntoIterator<Item = Preference>>(
+        preferences: PreferenceIterator,
         markers: &MarkerEnvironment,
     ) -> Self {
         Self(
-            requirements
+            // TODO(zanieb): We should explicitly ensure that when a package name is seen multiple times
+            // that the newest or oldest version is preferred dependning on the resolution strategy;
+            // right now, the order is dependent on the given iterator.
+            preferences
                 .into_iter()
                 .filter_map(|preference| {
                     let Preference {
@@ -84,26 +92,45 @@ impl Preferences {
 
                     // Search for, e.g., `flask==1.2.3` entries that match the current environment.
                     if !requirement.evaluate_markers(markers, &[]) {
+                        trace!(
+                            "Excluding {requirement} from preferences due to unmatched markers."
+                        );
                         return None;
                     }
-                    let Some(VersionOrUrl::VersionSpecifier(version_specifiers)) =
-                        requirement.version_or_url.as_ref()
-                    else {
-                        return None;
-                    };
-                    let [version_specifier] = version_specifiers.as_ref() else {
-                        return None;
-                    };
-                    if *version_specifier.operator() != Operator::Equal {
-                        return None;
+                    match requirement.version_or_url.as_ref() {
+                        Some(VersionOrUrl::VersionSpecifier(version_specifiers)) =>
+                         {
+                            let [version_specifier] = version_specifiers.as_ref() else {
+                                trace!(
+                                    "Excluding {requirement} from preferences due to multiple version specifiers."
+                                );
+                                return None;
+                            };
+                            if *version_specifier.operator() != Operator::Equal {
+                                trace!(
+                                    "Excluding {requirement} from preferences due to inexact version specifier."
+                                );
+                                return None;
+                            }
+                            Some((
+                                requirement.name,
+                                Pin {
+                                    version: version_specifier.version().clone(),
+                                    hashes,
+                                },
+                            ))
+                        }
+                        Some(VersionOrUrl::Url(_)) => {
+                            trace!(
+                                "Excluding {requirement} from preferences due to URL dependency."
+                            );
+                            None
+                        }
+                        _ => {
+                        None
                     }
-                    Some((
-                        requirement.name,
-                        Pin {
-                            version: version_specifier.version().clone(),
-                            hashes,
-                        },
-                    ))
+                    }
+
                 })
                 .collect(),
         )
@@ -119,7 +146,7 @@ impl Preferences {
         &self,
         package_name: &PackageName,
         version: &Version,
-    ) -> Option<&[Hashes]> {
+    ) -> Option<&[HashDigest]> {
         self.0
             .get(package_name)
             .filter(|pin| pin.version() == version)
@@ -131,7 +158,7 @@ impl Preferences {
 #[derive(Debug, Clone)]
 struct Pin {
     version: Version,
-    hashes: Vec<Hashes>,
+    hashes: Vec<HashDigest>,
 }
 
 impl Pin {
@@ -141,7 +168,7 @@ impl Pin {
     }
 
     /// Return the hashes of the pinned package.
-    fn hashes(&self) -> &[Hashes] {
+    fn hashes(&self) -> &[HashDigest] {
         &self.hashes
     }
 }

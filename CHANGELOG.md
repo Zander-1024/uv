@@ -1,5 +1,134 @@
 # Changelog
 
+## 0.1.31
+
+### Bug fixes
+
+- Ignore direct URL distributions in prefetcher ([#2943](https://github.com/astral-sh/uv/pull/2943))
+
+## 0.1.30
+
+### Enhancements
+
+- Show resolution diagnostics after `pip install` ([#2829](https://github.com/astral-sh/uv/pull/2829))
+
+### Performance
+
+- Speed up cold-cache `urllib3`-`boto3`-`botocore` performance with batched prefetching ([#2452](https://github.com/astral-sh/uv/pull/2452))
+
+### Bug fixes
+
+- Backtrack on distributions with invalid metadata ([#2834](https://github.com/astral-sh/uv/pull/2834))
+- Include LICENSE files in source distribution ([#2855](https://github.com/astral-sh/uv/pull/2855))
+- Respect `--no-build` and `--no-binary` in `--find-links` ([#2826](https://github.com/astral-sh/uv/pull/2826))
+- Respect cached local `--find-links` in install plan ([#2907](https://github.com/astral-sh/uv/pull/2907))
+- Avoid panic with multiple confirmation handlers ([#2903](https://github.com/astral-sh/uv/pull/2903))
+- Use scheme parsing to determine absolute vs. relative URLs ([#2904](https://github.com/astral-sh/uv/pull/2904))
+- Remove additional 'because' in resolution failure messages ([#2849](https://github.com/astral-sh/uv/pull/2849))
+- Use `miette` when printing `pip sync` resolution failures ([#2848](https://github.com/astral-sh/uv/pull/2848))
+
+## 0.1.29
+
+### Enhancements
+
+- Allow conflicting Git URLs that refer to the same commit SHA ([#2769](https://github.com/astral-sh/uv/pull/2769))
+- Allow package lookups across multiple indexes via explicit opt-in (`--index-strategy unsafe-any-match`) ([#2815](https://github.com/astral-sh/uv/pull/2815))
+- Allow no-op `--no-compile` flag on CLI ([#2816](https://github.com/astral-sh/uv/pull/2816))
+- Upgrade `rs-async-zip` to support data descriptors ([#2809](https://github.com/astral-sh/uv/pull/2809))
+
+### Bug fixes
+
+- Avoid unused extras check in `pip install` for source trees ([#2811](https://github.com/astral-sh/uv/pull/2811))
+- Deduplicate editables during install commands ([#2820](https://github.com/astral-sh/uv/pull/2820))
+- Fix windows lock race: lock exclusive after all try lock errors ([#2800](https://github.com/astral-sh/uv/pull/2800))
+- Preserve `.git` suffixes and casing in Git dependencies ([#2789](https://github.com/astral-sh/uv/pull/2789))
+- Respect Git tags and branches that look like short commits ([#2795](https://github.com/astral-sh/uv/pull/2795))
+- Enable virtualenv creation on Windows with cpython-x86 ([#2707](https://github.com/astral-sh/uv/pull/2707))
+
+### Documentation
+
+- Document that uv is safe to run concurrently ([#2818](https://github.com/astral-sh/uv/pull/2818))
+
+## 0.1.28
+
+### Enhancements
+
+- Recursively resolve direct URL references upfront ([#2684](https://github.com/astral-sh/uv/pull/2684))
+
+### Performance
+
+- Populate the in-memory index when resolving lookahead URLs ([#2761](https://github.com/astral-sh/uv/pull/2761))
+
+### Bug fixes
+
+- Detect Fish via `FISH_VERSION` ([#2781](https://github.com/astral-sh/uv/pull/2781))
+- Exclude installed distributions with multiple versions from consideration in the resolver ([#2779](https://github.com/astral-sh/uv/pull/2779))
+- Resolve non-determistic behavior in preferences due to site-packages ordering ([#2780](https://github.com/astral-sh/uv/pull/2780))
+- Use canonical URL to key redirect map ([#2764](https://github.com/astral-sh/uv/pull/2764))
+- Use distribution database and index for all pre-resolution phases ([#2766](https://github.com/astral-sh/uv/pull/2766))
+- Fix `uv self update` on Linux ([#2783](https://github.com/astral-sh/uv/pull/2783))
+
+## 0.1.27
+
+### Enhancements
+
+- Add `--exclude-editable` support to `pip-freeze` ([#2740](https://github.com/astral-sh/uv/pull/2740))
+- Add `pyproject.toml` et al to list of prompted packages ([#2746](https://github.com/astral-sh/uv/pull/2746))
+- Consider installed packages during resolution ([#2596](https://github.com/astral-sh/uv/pull/2596))
+- Recursively allow URL requirements for local dependencies ([#2702](https://github.com/astral-sh/uv/pull/2702))
+
+### Configuration
+
+- Add `UV_RESOLUTION` environment variable for `--resolution` ([#2720](https://github.com/astral-sh/uv/pull/2720))
+
+### Bug fixes
+
+- Respect overrides in all direct-dependency iterators ([#2742](https://github.com/astral-sh/uv/pull/2742))
+- Respect subdirectories when reading static metadata ([#2728](https://github.com/astral-sh/uv/pull/2728))
+
+## 0.1.26
+
+### Bug fixes
+
+- Bump simple cache version ([#2712](https://github.com/astral-sh/uv/pull/2712))
+
+## 0.1.25
+
+### Breaking changes
+
+- Limit overrides and constraints to `requirements.txt` format ([#2632](https://github.com/astral-sh/uv/pull/2632))
+
+### Enhancements
+
+- Accept `setup.py` and `setup.cfg` files in compile ([#2634](https://github.com/astral-sh/uv/pull/2634))
+- Add `--no-binary` and `--only-binary` support to `requirements.txt` ([#2680](https://github.com/astral-sh/uv/pull/2680))
+- Allow prereleases, locals, and URLs in non-editable path requirements ([#2671](https://github.com/astral-sh/uv/pull/2671))
+- Use PEP 517 to extract dynamic `pyproject.toml` metadata ([#2633](https://github.com/astral-sh/uv/pull/2633))
+- Add `Editable project location` and `Required-by` to `pip show` ([#2589](https://github.com/astral-sh/uv/pull/2589))
+- Avoid `prepare_metadata_for_build_wheel` calls for Hatch packages with dynamic dependencies ([#2645](https://github.com/astral-sh/uv/pull/2645))
+- Fall back to PEP 517 hooks for non-compliant PEP 621 metadata ([#2662](https://github.com/astral-sh/uv/pull/2662))
+- Support `file://localhost/` schemes ([#2657](https://github.com/astral-sh/uv/pull/2657))
+- Use normal resolver in `pip sync` ([#2696](https://github.com/astral-sh/uv/pull/2696))
+
+### CLI
+
+- Disallow `pyproject.toml` from `pip uninstall -r` ([#2663](https://github.com/astral-sh/uv/pull/2663))
+- Unhide `--emit-index-url` and `--emit-find-links` ([#2691](https://github.com/astral-sh/uv/pull/2691))
+- Use dense formatting for requirement version specifiers in diagnostics ([#2601](https://github.com/astral-sh/uv/pull/2601))
+
+### Performance
+
+- Add an in-memory cache for Git references ([#2682](https://github.com/astral-sh/uv/pull/2682))
+- Do not force-recompile `.pyc` files ([#2642](https://github.com/astral-sh/uv/pull/2642))
+- Read package metadata from `pyproject.toml` when it is statically defined ([#2676](https://github.com/astral-sh/uv/pull/2676))
+
+### Bug fixes
+
+- Don't error on multiple matching index URLs ([#2627](https://github.com/astral-sh/uv/pull/2627))
+- Extract local versions from direct URL requirements ([#2624](https://github.com/astral-sh/uv/pull/2624))
+- Respect `--no-index` with `--find-links` in `pip sync` ([#2692](https://github.com/astral-sh/uv/pull/2692))
+- Use `Scripts` folder for virtualenv activation prompt ([#2690](https://github.com/astral-sh/uv/pull/2690))
+
 ## 0.1.24
 
 ### Breaking changes
@@ -541,7 +670,7 @@ pass the `--native-tls` command-line flag to enable this behavior.
 - Avoid attempting rename in copy fallback path ([#1546](https://github.com/astral-sh/uv/pull/1546))
 - Fix list rendering in `venv --help` output ([#1459](https://github.com/astral-sh/uv/pull/1459))
 - Fix trailing commas on `Requires-Python` in HTML indexes  ([#1507](https://github.com/astral-sh/uv/pull/1507))
-- Read from `/bin/sh` if `/bin/ls` cannot be found when determing libc path ([#1433](https://github.com/astral-sh/uv/pull/1433))
+- Read from `/bin/sh` if `/bin/ls` cannot be found when determining libc path ([#1433](https://github.com/astral-sh/uv/pull/1433))
 - Remove URL encoding when determining file name ([#1555](https://github.com/astral-sh/uv/pull/1555))
 - Support recursive extras ([#1435](https://github.com/astral-sh/uv/pull/1435))
 - Use comparable representation for `PackageId` ([#1543](https://github.com/astral-sh/uv/pull/1543))
@@ -597,4 +726,4 @@ pass the `--native-tls` command-line flag to enable this behavior.
 ### Documentation
 
 - Fix diagram alignment ([#1354](https://github.com/astral-sh/uv/pull/1354))
-- Grammer nit ([#1345](https://github.com/astral-sh/uv/pull/1345))
+- Grammar nit ([#1345](https://github.com/astral-sh/uv/pull/1345))

@@ -11,17 +11,17 @@ use miette::{Diagnostic, IntoDiagnostic};
 use owo_colors::OwoColorize;
 use thiserror::Error;
 
-use distribution_types::{DistributionMetadata, IndexLocations, Name};
+use distribution_types::{DistributionMetadata, IndexLocations, Name, ResolvedDist};
 use pep508_rs::Requirement;
 use uv_auth::{KeyringProvider, GLOBAL_AUTH_STORE};
 use uv_cache::Cache;
-use uv_client::{Connectivity, FlatIndex, FlatIndexClient, RegistryClientBuilder};
+use uv_client::{Connectivity, FlatIndexClient, RegistryClientBuilder};
+use uv_configuration::{ConfigSettings, IndexStrategy, NoBinary, NoBuild, SetupPyStrategy};
 use uv_dispatch::BuildDispatch;
 use uv_fs::Simplified;
-use uv_installer::NoBinary;
 use uv_interpreter::{find_default_python, find_requested_python, Error};
-use uv_resolver::{InMemoryIndex, OptionsBuilder};
-use uv_types::{BuildContext, BuildIsolation, ConfigSettings, InFlight, NoBuild, SetupPyStrategy};
+use uv_resolver::{FlatIndex, InMemoryIndex, OptionsBuilder};
+use uv_types::{BuildContext, BuildIsolation, HashStrategy, InFlight};
 
 use crate::commands::ExitStatus;
 use crate::printer::Printer;
@@ -33,6 +33,7 @@ pub(crate) async fn venv(
     path: &Path,
     python_request: Option<&str>,
     index_locations: &IndexLocations,
+    index_strategy: IndexStrategy,
     keyring_provider: KeyringProvider,
     prompt: uv_virtualenv::Prompt,
     system_site_packages: bool,
@@ -47,6 +48,7 @@ pub(crate) async fn venv(
         path,
         python_request,
         index_locations,
+        index_strategy,
         keyring_provider,
         prompt,
         system_site_packages,
@@ -92,6 +94,7 @@ async fn venv_impl(
     path: &Path,
     python_request: Option<&str>,
     index_locations: &IndexLocations,
+    index_strategy: IndexStrategy,
     keyring_provider: KeyringProvider,
     prompt: uv_virtualenv::Prompt,
     system_site_packages: bool,
@@ -149,6 +152,7 @@ async fn venv_impl(
         let client = RegistryClientBuilder::new(cache.clone())
             .native_tls(native_tls)
             .index_urls(index_locations.index_urls())
+            .index_strategy(index_strategy)
             .keyring_provider(keyring_provider)
             .connectivity(connectivity)
             .markers(interpreter.markers())
@@ -163,7 +167,13 @@ async fn venv_impl(
                 .fetch(index_locations.flat_index())
                 .await
                 .map_err(VenvError::FlatIndex)?;
-            FlatIndex::from_entries(entries, tags)
+            FlatIndex::from_entries(
+                entries,
+                tags,
+                &HashStrategy::None,
+                &NoBuild::All,
+                &NoBinary::None,
+            )
         };
 
         // Create a shared in-memory index.
@@ -213,6 +223,10 @@ async fn venv_impl(
 
         for distribution in resolution
             .distributions()
+            .filter_map(|dist| match dist {
+                ResolvedDist::Installable(dist) => Some(dist),
+                ResolvedDist::Installed(_) => None,
+            })
             .sorted_unstable_by(|a, b| a.name().cmp(b.name()).then(a.version().cmp(&b.version())))
         {
             writeln!(

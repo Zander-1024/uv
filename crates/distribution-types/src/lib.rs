@@ -51,11 +51,13 @@ pub use crate::direct_url::*;
 pub use crate::editable::*;
 pub use crate::error::*;
 pub use crate::file::*;
+pub use crate::hash::*;
 pub use crate::id::*;
 pub use crate::index_url::*;
 pub use crate::installed::*;
 pub use crate::prioritized_distribution::*;
 pub use crate::resolution::*;
+pub use crate::resolved::*;
 pub use crate::traits::*;
 
 mod any;
@@ -65,11 +67,13 @@ mod direct_url;
 mod editable;
 mod error;
 mod file;
+mod hash;
 mod id;
 mod index_url;
 mod installed;
 mod prioritized_distribution;
 mod resolution;
+mod resolved;
 mod traits;
 
 #[derive(Debug, Clone)]
@@ -361,6 +365,22 @@ impl Dist {
         })))
     }
 
+    /// Return true if the distribution is editable.
+    pub fn is_editable(&self) -> bool {
+        match self {
+            Self::Source(dist) => dist.is_editable(),
+            Self::Built(_) => false,
+        }
+    }
+
+    /// Returns the [`IndexUrl`], if the distribution is from a registry.
+    pub fn index(&self) -> Option<&IndexUrl> {
+        match self {
+            Self::Built(dist) => dist.index(),
+            Self::Source(dist) => dist.index(),
+        }
+    }
+
     /// Returns the [`File`] instance, if this dist is from a registry with simple json api support
     pub fn file(&self) -> Option<&File> {
         match self {
@@ -378,7 +398,16 @@ impl Dist {
 }
 
 impl BuiltDist {
-    /// Returns the [`File`] instance, if this dist is from a registry with simple json api support
+    /// Returns the [`IndexUrl`], if the distribution is from a registry.
+    pub fn index(&self) -> Option<&IndexUrl> {
+        match self {
+            Self::Registry(registry) => Some(&registry.index),
+            Self::DirectUrl(_) => None,
+            Self::Path(_) => None,
+        }
+    }
+
+    /// Returns the [`File`] instance, if this distribution is from a registry.
     pub fn file(&self) -> Option<&File> {
         match self {
             Self::Registry(registry) => Some(&registry.file),
@@ -396,6 +425,14 @@ impl BuiltDist {
 }
 
 impl SourceDist {
+    /// Returns the [`IndexUrl`], if the distribution is from a registry.
+    pub fn index(&self) -> Option<&IndexUrl> {
+        match self {
+            Self::Registry(registry) => Some(&registry.index),
+            Self::DirectUrl(_) | Self::Git(_) | Self::Path(_) => None,
+        }
+    }
+
     /// Returns the [`File`] instance, if this dist is from a registry with simple json api support
     pub fn file(&self) -> Option<&File> {
         match self {
@@ -414,15 +451,19 @@ impl SourceDist {
     #[must_use]
     pub fn with_url(self, url: Url) -> Self {
         match self {
-            Self::DirectUrl(dist) => Self::DirectUrl(DirectUrlSourceDist {
-                url: VerbatimUrl::unknown(url),
-                ..dist
-            }),
             Self::Git(dist) => Self::Git(GitSourceDist {
                 url: VerbatimUrl::unknown(url),
                 ..dist
             }),
             dist => dist,
+        }
+    }
+
+    /// Return true if the distribution is editable.
+    pub fn is_editable(&self) -> bool {
+        match self {
+            Self::Path(PathSourceDist { editable, .. }) => *editable,
+            _ => false,
         }
     }
 
@@ -750,26 +791,26 @@ impl RemoteSource for Dist {
 
 impl Identifier for Url {
     fn distribution_id(&self) -> DistributionId {
-        DistributionId::new(cache_key::digest(&cache_key::CanonicalUrl::new(self)))
+        DistributionId::Url(cache_key::CanonicalUrl::new(self))
     }
 
     fn resource_id(&self) -> ResourceId {
-        ResourceId::new(cache_key::digest(&cache_key::RepositoryUrl::new(self)))
+        ResourceId::Url(cache_key::RepositoryUrl::new(self))
     }
 }
 
 impl Identifier for File {
     fn distribution_id(&self) -> DistributionId {
-        if let Some(hash) = self.hashes.as_str() {
-            DistributionId::new(hash)
+        if let Some(hash) = self.hashes.first() {
+            DistributionId::Digest(hash.clone())
         } else {
             self.url.distribution_id()
         }
     }
 
     fn resource_id(&self) -> ResourceId {
-        if let Some(hash) = self.hashes.as_str() {
-            ResourceId::new(hash)
+        if let Some(hash) = self.hashes.first() {
+            ResourceId::Digest(hash.clone())
         } else {
             self.url.resource_id()
         }
@@ -778,67 +819,31 @@ impl Identifier for File {
 
 impl Identifier for Path {
     fn distribution_id(&self) -> DistributionId {
-        DistributionId::new(cache_key::digest(&self))
+        DistributionId::PathBuf(self.to_path_buf())
     }
 
     fn resource_id(&self) -> ResourceId {
-        ResourceId::new(cache_key::digest(&self))
-    }
-}
-
-impl Identifier for String {
-    fn distribution_id(&self) -> DistributionId {
-        DistributionId::new(cache_key::digest(&self))
-    }
-
-    fn resource_id(&self) -> ResourceId {
-        ResourceId::new(cache_key::digest(&self))
-    }
-}
-
-impl Identifier for &str {
-    fn distribution_id(&self) -> DistributionId {
-        DistributionId::new(cache_key::digest(&self))
-    }
-
-    fn resource_id(&self) -> ResourceId {
-        ResourceId::new(cache_key::digest(&self))
-    }
-}
-
-impl Identifier for (&str, &str) {
-    fn distribution_id(&self) -> DistributionId {
-        DistributionId::new(cache_key::digest(&self))
-    }
-
-    fn resource_id(&self) -> ResourceId {
-        ResourceId::new(cache_key::digest(&self))
-    }
-}
-
-impl Identifier for (&Url, &str) {
-    fn distribution_id(&self) -> DistributionId {
-        DistributionId::new(cache_key::digest(&self))
-    }
-
-    fn resource_id(&self) -> ResourceId {
-        ResourceId::new(cache_key::digest(&self))
+        ResourceId::PathBuf(self.to_path_buf())
     }
 }
 
 impl Identifier for FileLocation {
     fn distribution_id(&self) -> DistributionId {
         match self {
-            Self::RelativeUrl(base, url) => (base.as_str(), url.as_str()).distribution_id(),
-            Self::AbsoluteUrl(url) => url.distribution_id(),
+            Self::RelativeUrl(base, url) => {
+                DistributionId::RelativeUrl(base.to_string(), url.to_string())
+            }
+            Self::AbsoluteUrl(url) => DistributionId::AbsoluteUrl(url.to_string()),
             Self::Path(path) => path.distribution_id(),
         }
     }
 
     fn resource_id(&self) -> ResourceId {
         match self {
-            Self::RelativeUrl(base, url) => (base.as_str(), url.as_str()).resource_id(),
-            Self::AbsoluteUrl(url) => url.resource_id(),
+            Self::RelativeUrl(base, url) => {
+                ResourceId::RelativeUrl(base.to_string(), url.to_string())
+            }
+            Self::AbsoluteUrl(url) => ResourceId::AbsoluteUrl(url.to_string()),
             Self::Path(path) => path.resource_id(),
         }
     }
@@ -952,6 +957,16 @@ impl Identifier for BuiltDist {
     }
 }
 
+impl Identifier for InstalledDist {
+    fn distribution_id(&self) -> DistributionId {
+        self.path().distribution_id()
+    }
+
+    fn resource_id(&self) -> ResourceId {
+        self.path().resource_id()
+    }
+}
+
 impl Identifier for Dist {
     fn distribution_id(&self) -> DistributionId {
         match self {
@@ -964,6 +979,70 @@ impl Identifier for Dist {
         match self {
             Self::Built(dist) => dist.resource_id(),
             Self::Source(dist) => dist.resource_id(),
+        }
+    }
+}
+
+impl Identifier for DirectSourceUrl<'_> {
+    fn distribution_id(&self) -> DistributionId {
+        self.url.distribution_id()
+    }
+
+    fn resource_id(&self) -> ResourceId {
+        self.url.resource_id()
+    }
+}
+
+impl Identifier for GitSourceUrl<'_> {
+    fn distribution_id(&self) -> DistributionId {
+        self.url.distribution_id()
+    }
+
+    fn resource_id(&self) -> ResourceId {
+        self.url.resource_id()
+    }
+}
+
+impl Identifier for PathSourceUrl<'_> {
+    fn distribution_id(&self) -> DistributionId {
+        self.url.distribution_id()
+    }
+
+    fn resource_id(&self) -> ResourceId {
+        self.url.resource_id()
+    }
+}
+
+impl Identifier for SourceUrl<'_> {
+    fn distribution_id(&self) -> DistributionId {
+        match self {
+            Self::Direct(url) => url.distribution_id(),
+            Self::Git(url) => url.distribution_id(),
+            Self::Path(url) => url.distribution_id(),
+        }
+    }
+
+    fn resource_id(&self) -> ResourceId {
+        match self {
+            Self::Direct(url) => url.resource_id(),
+            Self::Git(url) => url.resource_id(),
+            Self::Path(url) => url.resource_id(),
+        }
+    }
+}
+
+impl Identifier for BuildableSource<'_> {
+    fn distribution_id(&self) -> DistributionId {
+        match self {
+            BuildableSource::Dist(source) => source.distribution_id(),
+            BuildableSource::Url(source) => source.distribution_id(),
+        }
+    }
+
+    fn resource_id(&self) -> ResourceId {
+        match self {
+            BuildableSource::Dist(source) => source.resource_id(),
+            BuildableSource::Url(source) => source.resource_id(),
         }
     }
 }

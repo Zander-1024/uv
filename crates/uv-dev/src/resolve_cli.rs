@@ -12,12 +12,13 @@ use petgraph::dot::{Config as DotConfig, Dot};
 use distribution_types::{FlatIndexLocation, IndexLocations, IndexUrl, Resolution};
 use pep508_rs::Requirement;
 use uv_cache::{Cache, CacheArgs};
-use uv_client::{FlatIndex, FlatIndexClient, RegistryClientBuilder};
+use uv_client::{FlatIndexClient, RegistryClientBuilder};
+use uv_configuration::{ConfigSettings, NoBinary, NoBuild, SetupPyStrategy};
 use uv_dispatch::BuildDispatch;
-use uv_installer::NoBinary;
+use uv_installer::SitePackages;
 use uv_interpreter::PythonEnvironment;
-use uv_resolver::{InMemoryIndex, Manifest, Options, Resolver};
-use uv_types::{BuildIsolation, ConfigSettings, InFlight, NoBuild, SetupPyStrategy};
+use uv_resolver::{FlatIndex, InMemoryIndex, Manifest, Options, Resolver};
+use uv_types::{BuildIsolation, HashStrategy, InFlight};
 
 #[derive(ValueEnum, Default, Clone)]
 pub(crate) enum ResolveCliFormat {
@@ -56,20 +57,26 @@ pub(crate) async fn resolve_cli(args: ResolveCliArgs) -> Result<()> {
     let venv = PythonEnvironment::from_virtualenv(&cache)?;
     let index_locations =
         IndexLocations::new(args.index_url, args.extra_index_url, args.find_links, false);
-    let client = RegistryClientBuilder::new(cache.clone())
-        .index_urls(index_locations.index_urls())
-        .build();
-    let flat_index = {
-        let client = FlatIndexClient::new(&client, &cache);
-        let entries = client.fetch(index_locations.flat_index()).await?;
-        FlatIndex::from_entries(entries, venv.interpreter().tags()?)
-    };
     let index = InMemoryIndex::default();
     let in_flight = InFlight::default();
     let no_build = if args.no_build {
         NoBuild::All
     } else {
         NoBuild::None
+    };
+    let client = RegistryClientBuilder::new(cache.clone())
+        .index_urls(index_locations.index_urls())
+        .build();
+    let flat_index = {
+        let client = FlatIndexClient::new(&client, &cache);
+        let entries = client.fetch(index_locations.flat_index()).await?;
+        FlatIndex::from_entries(
+            entries,
+            venv.interpreter().tags()?,
+            &HashStrategy::None,
+            &no_build,
+            &NoBinary::None,
+        )
     };
     let config_settings = ConfigSettings::default();
 
@@ -88,6 +95,8 @@ pub(crate) async fn resolve_cli(args: ResolveCliArgs) -> Result<()> {
         &NoBinary::None,
     );
 
+    let site_packages = SitePackages::from_executable(&venv)?;
+
     // Copied from `BuildDispatch`
     let tags = venv.interpreter().tags()?;
     let resolver = Resolver::new(
@@ -99,7 +108,9 @@ pub(crate) async fn resolve_cli(args: ResolveCliArgs) -> Result<()> {
         &client,
         &flat_index,
         &index,
+        &HashStrategy::None,
         &build_dispatch,
+        &site_packages,
     )?;
     let resolution_graph = resolver.resolve().await.with_context(|| {
         format!(

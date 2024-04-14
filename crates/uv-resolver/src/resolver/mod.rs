@@ -14,12 +14,11 @@ use pubgrub::range::Range;
 use pubgrub::solver::{Incompatibility, State};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info_span, instrument, trace, Instrument};
-use url::Url;
+use tracing::{debug, info_span, instrument, trace, warn, Instrument};
 
 use distribution_types::{
     BuiltDist, Dist, DistributionMetadata, IncompatibleDist, IncompatibleSource, IncompatibleWheel,
-    Name, RemoteSource, SourceDist, VersionOrUrl,
+    InstalledDist, Name, RemoteSource, ResolvedDist, ResolvedDistRef, SourceDist, VersionOrUrl,
 };
 pub(crate) use locals::Locals;
 use pep440_rs::{Version, MIN_VERSION};
@@ -27,18 +26,17 @@ use pep508_rs::{MarkerEnvironment, Requirement};
 use platform_tags::Tags;
 use pypi_types::Metadata23;
 pub(crate) use urls::Urls;
-use uv_client::{FlatIndex, RegistryClient};
-use uv_distribution::DistributionDatabase;
+use uv_client::RegistryClient;
+use uv_configuration::{Constraints, Overrides};
+use uv_distribution::{ArchiveMetadata, DistributionDatabase};
 use uv_interpreter::Interpreter;
 use uv_normalize::PackageName;
-use uv_types::BuildContext;
+use uv_types::{BuildContext, HashStrategy, InstalledPackagesProvider};
 
 use crate::candidate_selector::{CandidateDist, CandidateSelector};
-use crate::constraints::Constraints;
 use crate::editables::Editables;
 use crate::error::ResolveError;
 use crate::manifest::Manifest;
-use crate::overrides::Overrides;
 use crate::pins::FilePins;
 use crate::preferences::Preferences;
 use crate::pubgrub::{
@@ -47,16 +45,18 @@ use crate::pubgrub::{
 };
 use crate::python_requirement::PythonRequirement;
 use crate::resolution::ResolutionGraph;
+use crate::resolver::batch_prefetch::BatchPrefetcher;
 pub use crate::resolver::index::InMemoryIndex;
 pub use crate::resolver::provider::{
-    DefaultResolverProvider, PackageVersionsResult, ResolverProvider, VersionsResponse,
-    WheelMetadataResult,
+    DefaultResolverProvider, MetadataResponse, PackageVersionsResult, ResolverProvider,
+    VersionsResponse, WheelMetadataResult,
 };
 use crate::resolver::reporter::Facade;
 pub use crate::resolver::reporter::{BuildId, Reporter};
 use crate::yanks::AllowedYanks;
-use crate::{DependencyMode, Options};
+use crate::{DependencyMode, Exclusions, FlatIndex, Options};
 
+mod batch_prefetch;
 mod index;
 mod locals;
 mod provider;
@@ -71,15 +71,32 @@ pub(crate) enum UnavailableVersion {
     IncompatibleDist(IncompatibleDist),
 }
 
-/// The package is unavailable and cannot be used
+/// The package is unavailable and cannot be used.
 #[derive(Debug, Clone)]
 pub(crate) enum UnavailablePackage {
-    /// Index lookups were disabled (i.e., `--no-index`) and the package was not found in a flat index (i.e. from `--find-links`)
+    /// Index lookups were disabled (i.e., `--no-index`) and the package was not found in a flat index (i.e. from `--find-links`).
     NoIndex,
     /// Network requests were disabled (i.e., `--offline`), and the package was not found in the cache.
     Offline,
-    /// The package was not found in the registry
+    /// The package was not found in the registry.
     NotFound,
+    /// The package metadata was found, but could not be parsed.
+    InvalidMetadata(String),
+    /// The package has an invalid structure.
+    InvalidStructure(String),
+}
+
+/// The package is unavailable at specific versions.
+#[derive(Debug, Clone)]
+pub(crate) enum IncompletePackage {
+    /// Network requests were disabled (i.e., `--offline`), and the wheel metadata was not found in the cache.
+    Offline,
+    /// The wheel metadata was found, but could not be parsed.
+    InvalidMetadata(String),
+    /// The wheel metadata was found, but the metadata was inconsistent.
+    InconsistentMetadata(String),
+    /// The wheel has an invalid structure.
+    InvalidStructure(String),
 }
 
 enum ResolverVersion {
@@ -89,29 +106,43 @@ enum ResolverVersion {
     Unavailable(Version, UnavailableVersion),
 }
 
-pub struct Resolver<'a, Provider: ResolverProvider> {
+pub struct Resolver<
+    'a,
+    Provider: ResolverProvider,
+    InstalledPackages: InstalledPackagesProvider + Send + Sync,
+> {
     project: Option<PackageName>,
     requirements: Vec<Requirement>,
     constraints: Constraints,
     overrides: Overrides,
     preferences: Preferences,
+    exclusions: Exclusions,
     editables: Editables,
     urls: Urls,
     locals: Locals,
     dependency_mode: DependencyMode,
+    hasher: &'a HashStrategy,
     markers: &'a MarkerEnvironment,
     python_requirement: PythonRequirement,
     selector: CandidateSelector,
     index: &'a InMemoryIndex,
-    /// Incompatibilities for packages that are entirely unavailable
+    installed_packages: &'a InstalledPackages,
+    /// Incompatibilities for packages that are entirely unavailable.
     unavailable_packages: DashMap<PackageName, UnavailablePackage>,
+    /// Incompatibilities for packages that are unavailable at specific versions.
+    incomplete_packages: DashMap<PackageName, DashMap<Version, IncompletePackage>>,
     /// The set of all registry-based packages visited during resolution.
     visited: DashSet<PackageName>,
     reporter: Option<Arc<dyn Reporter>>,
     provider: Provider,
 }
 
-impl<'a, Context: BuildContext + Send + Sync> Resolver<'a, DefaultResolverProvider<'a, Context>> {
+impl<
+        'a,
+        Context: BuildContext + Send + Sync,
+        InstalledPackages: InstalledPackagesProvider + Send + Sync,
+    > Resolver<'a, DefaultResolverProvider<'a, Context>, InstalledPackages>
+{
     /// Initialize a new resolver using the default backend doing real requests.
     ///
     /// Reads the flat index entries.
@@ -125,15 +156,18 @@ impl<'a, Context: BuildContext + Send + Sync> Resolver<'a, DefaultResolverProvid
         client: &'a RegistryClient,
         flat_index: &'a FlatIndex,
         index: &'a InMemoryIndex,
+        hasher: &'a HashStrategy,
         build_context: &'a Context,
+        installed_packages: &'a InstalledPackages,
     ) -> Result<Self, ResolveError> {
         let provider = DefaultResolverProvider::new(
             client,
-            DistributionDatabase::new(build_context.cache(), client, build_context),
+            DistributionDatabase::new(client, build_context),
             flat_index,
             tags,
             PythonRequirement::new(interpreter, markers),
             AllowedYanks::from_manifest(&manifest, markers),
+            hasher,
             options.exclude_newer,
             build_context.no_binary(),
             build_context.no_build(),
@@ -141,27 +175,38 @@ impl<'a, Context: BuildContext + Send + Sync> Resolver<'a, DefaultResolverProvid
         Self::new_custom_io(
             manifest,
             options,
+            hasher,
             markers,
             PythonRequirement::new(interpreter, markers),
             index,
             provider,
+            installed_packages,
         )
     }
 }
 
-impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
+impl<
+        'a,
+        Provider: ResolverProvider,
+        InstalledPackages: InstalledPackagesProvider + Send + Sync,
+    > Resolver<'a, Provider, InstalledPackages>
+{
     /// Initialize a new resolver using a user provided backend.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_custom_io(
         manifest: Manifest,
         options: Options,
+        hasher: &'a HashStrategy,
         markers: &'a MarkerEnvironment,
         python_requirement: PythonRequirement,
         index: &'a InMemoryIndex,
         provider: Provider,
+        installed_packages: &'a InstalledPackages,
     ) -> Result<Self, ResolveError> {
         Ok(Self {
             index,
             unavailable_packages: DashMap::default(),
+            incomplete_packages: DashMap::default(),
             visited: DashSet::default(),
             selector: CandidateSelector::for_resolution(options, &manifest, markers),
             dependency_mode: options.dependency_mode,
@@ -169,14 +214,17 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
             locals: Locals::from_manifest(&manifest, markers),
             project: manifest.project,
             requirements: manifest.requirements,
-            constraints: Constraints::from_requirements(manifest.constraints),
-            overrides: Overrides::from_requirements(manifest.overrides),
-            preferences: Preferences::from_requirements(manifest.preferences, markers),
+            constraints: manifest.constraints,
+            overrides: manifest.overrides,
+            preferences: Preferences::from_iter(manifest.preferences, markers),
+            exclusions: manifest.exclusions,
             editables: Editables::from_requirements(manifest.editables),
+            hasher,
             markers,
             python_requirement,
             reporter: None,
             provider,
+            installed_packages,
         })
     }
 
@@ -195,14 +243,14 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
     pub async fn resolve(self) -> Result<ResolutionGraph, ResolveError> {
         // A channel to fetch package metadata (e.g., given `flask`, fetch all versions) and version
         // metadata (e.g., given `flask==1.0.0`, fetch the metadata for that version).
-        // Channel size is set to the same size as the task buffer for simplicity.
-        let (request_sink, request_stream) = tokio::sync::mpsc::channel(50);
+        // Channel size is set large to accommodate batch prefetching.
+        let (request_sink, request_stream) = tokio::sync::mpsc::channel(300);
 
         // Run the fetcher.
         let requests_fut = self.fetch(request_stream).fuse();
 
         // Run the solver.
-        let resolve_fut = self.solve(request_sink).fuse();
+        let resolve_fut = self.solve(request_sink).boxed().fuse();
 
         // Wait for both to complete.
         match tokio::try_join!(requests_fut, resolve_fut) {
@@ -222,7 +270,8 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                         .with_selector(self.selector.clone())
                         .with_python_requirement(&self.python_requirement)
                         .with_index_locations(self.provider.index_locations())
-                        .with_unavailable_packages(&self.unavailable_packages),
+                        .with_unavailable_packages(&self.unavailable_packages)
+                        .with_incomplete_packages(&self.incomplete_packages),
                     )
                 } else {
                     err
@@ -238,6 +287,7 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
         request_sink: tokio::sync::mpsc::Sender<Request>,
     ) -> Result<ResolutionGraph, ResolveError> {
         let root = PubGrubPackage::Root(self.project.clone());
+        let mut prefetcher = BatchPrefetcher::default();
 
         // Keep track of the packages for which we've requested metadata.
         let mut pins = FilePins::default();
@@ -279,13 +329,14 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                     &pins,
                     &self.index.packages,
                     &self.index.distributions,
-                    &self.index.redirects,
                     &state,
                     &self.preferences,
                     self.editables.clone(),
                 );
             };
             next = highest_priority_pkg;
+
+            prefetcher.version_tried(next.clone());
 
             let term_intersection = state
                 .partial_solution
@@ -324,6 +375,12 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                                     UnavailablePackage::Offline => "was not found in the cache",
                                     UnavailablePackage::NotFound => {
                                         "was not found in the package registry"
+                                    }
+                                    UnavailablePackage::InvalidMetadata(_) => {
+                                        "was found, but the metadata could not be parsed"
+                                    }
+                                    UnavailablePackage::InvalidStructure(_) => {
+                                        "was found, but has an invalid format"
                                     }
                                 })
                         } else {
@@ -388,6 +445,17 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                 }
             };
 
+            prefetcher
+                .prefetch_batches(
+                    &next,
+                    &version,
+                    term_intersection.unwrap_positive(),
+                    &request_sink,
+                    self.index,
+                    &self.selector,
+                )
+                .await?;
+
             self.on_progress(&next, &version);
 
             if added_dependencies
@@ -402,18 +470,10 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                     .await?
                 {
                     Dependencies::Unavailable(reason) => {
-                        let message = {
-                            if matches!(package, PubGrubPackage::Root(_)) {
-                                // Including front-matter for the root package is redundant
-                                reason.clone()
-                            } else {
-                                format!("its dependencies are unusable because {reason}")
-                            }
-                        };
                         state.add_incompatibility(Incompatibility::unavailable(
                             package.clone(),
                             version.clone(),
-                            message,
+                            reason.clone(),
                         ));
                         continue;
                     }
@@ -463,19 +523,27 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
         match package {
             PubGrubPackage::Root(_) => {}
             PubGrubPackage::Python(_) => {}
-            PubGrubPackage::Package(package_name, _extra, None) => {
+            PubGrubPackage::Package(name, _extra, None) => {
+                // Verify that the package is allowed under the hash-checking policy.
+                if !self.hasher.allows_package(name) {
+                    return Err(ResolveError::UnhashedPackage(name.clone()));
+                }
+
                 // Emit a request to fetch the metadata for this package.
-                if self.index.packages.register(package_name.clone()) {
-                    priorities.add(package_name.clone());
-                    request_sink
-                        .send(Request::Package(package_name.clone()))
-                        .await?;
+                if self.index.packages.register(name.clone()) {
+                    priorities.add(name.clone());
+                    request_sink.send(Request::Package(name.clone())).await?;
                 }
             }
-            PubGrubPackage::Package(package_name, _extra, Some(url)) => {
+            PubGrubPackage::Package(name, _extra, Some(url)) => {
+                // Verify that the package is allowed under the hash-checking policy.
+                if !self.hasher.allows_url(url) {
+                    return Err(ResolveError::UnhashedPackage(name.clone()));
+                }
+
                 // Emit a request to fetch the metadata for this distribution.
-                let dist = Dist::from_url(package_name.clone(), url.clone())?;
-                if self.index.distributions.register(dist.package_id()) {
+                let dist = Dist::from_url(name.clone(), url.clone())?;
+                if self.index.distributions.register(dist.version_id()) {
                     priorities.add(dist.name().clone());
                     request_sink.send(Request::Dist(dist)).await?;
                 }
@@ -573,12 +641,44 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                 }
 
                 let dist = PubGrubDistribution::from_url(package_name, url);
-                let metadata = self
+                let response = self
                     .index
                     .distributions
-                    .wait(&dist.package_id())
+                    .wait(&dist.version_id())
                     .await
                     .ok_or(ResolveError::Unregistered)?;
+
+                // If we failed to fetch the metadata for a URL, we can't proceed.
+                let metadata = match &*response {
+                    MetadataResponse::Found(archive) => &archive.metadata,
+                    MetadataResponse::Offline => {
+                        self.unavailable_packages
+                            .insert(package_name.clone(), UnavailablePackage::Offline);
+                        return Ok(None);
+                    }
+                    MetadataResponse::InvalidMetadata(err) => {
+                        self.unavailable_packages.insert(
+                            package_name.clone(),
+                            UnavailablePackage::InvalidMetadata(err.to_string()),
+                        );
+                        return Ok(None);
+                    }
+                    MetadataResponse::InconsistentMetadata(err) => {
+                        self.unavailable_packages.insert(
+                            package_name.clone(),
+                            UnavailablePackage::InvalidMetadata(err.to_string()),
+                        );
+                        return Ok(None);
+                    }
+                    MetadataResponse::InvalidStructure(err) => {
+                        self.unavailable_packages.insert(
+                            package_name.clone(),
+                            UnavailablePackage::InvalidStructure(err.to_string()),
+                        );
+                        return Ok(None);
+                    }
+                };
+
                 let version = &metadata.version;
 
                 // The version is incompatible with the requirement.
@@ -613,26 +713,22 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                     .ok_or(ResolveError::Unregistered)?;
                 self.visited.insert(package_name.clone());
 
-                let version_map = match *versions_response {
-                    VersionsResponse::Found(ref version_map) => version_map,
-                    // Short-circuit if we do not find any versions for the package
+                let version_maps = match *versions_response {
+                    VersionsResponse::Found(ref version_maps) => version_maps.as_slice(),
                     VersionsResponse::NoIndex => {
                         self.unavailable_packages
                             .insert(package_name.clone(), UnavailablePackage::NoIndex);
-
-                        return Ok(None);
+                        &[]
                     }
                     VersionsResponse::Offline => {
                         self.unavailable_packages
                             .insert(package_name.clone(), UnavailablePackage::Offline);
-
-                        return Ok(None);
+                        &[]
                     }
                     VersionsResponse::NotFound => {
                         self.unavailable_packages
                             .insert(package_name.clone(), UnavailablePackage::NotFound);
-
-                        return Ok(None);
+                        &[]
                     }
                 };
 
@@ -645,10 +741,14 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                 }
 
                 // Find a version.
-                let Some(candidate) =
-                    self.selector
-                        .select(package_name, range, version_map, &self.preferences)
-                else {
+                let Some(candidate) = self.selector.select(
+                    package_name,
+                    range,
+                    version_maps,
+                    &self.preferences,
+                    self.installed_packages,
+                    &self.exclusions,
+                ) else {
                     // Short circuit: we couldn't find _any_ versions for a package.
                     return Ok(None);
                 };
@@ -664,24 +764,26 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                     }
                 };
 
+                let filename = match dist.for_installation() {
+                    ResolvedDistRef::Installable(dist) => {
+                        dist.filename().unwrap_or(Cow::Borrowed("unknown filename"))
+                    }
+                    ResolvedDistRef::Installed(_) => Cow::Borrowed("installed"),
+                };
                 if let Some(extra) = extra {
                     debug!(
                         "Selecting: {}[{}]=={} ({})",
                         candidate.name(),
                         extra,
                         candidate.version(),
-                        dist.for_resolution()
-                            .filename()
-                            .unwrap_or(Cow::Borrowed("unknown filename"))
+                        filename,
                     );
                 } else {
                     debug!(
                         "Selecting: {}=={} ({})",
                         candidate.name(),
                         candidate.version(),
-                        dist.for_resolution()
-                            .filename()
-                            .unwrap_or(Cow::Borrowed("unknown filename"))
+                        filename,
                     );
                 }
 
@@ -692,11 +794,13 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                 let version = candidate.version().clone();
 
                 // Emit a request to fetch the metadata for this version.
-                if self.index.distributions.register(candidate.package_id()) {
-                    let dist = dist.for_resolution().clone();
-                    request_sink.send(Request::Dist(dist)).await?;
+                if self.index.distributions.register(candidate.version_id()) {
+                    let request = match dist.for_resolution() {
+                        ResolvedDistRef::Installable(dist) => Request::Dist(dist.clone()),
+                        ResolvedDistRef::Installed(dist) => Request::Installed(dist.clone()),
+                    };
+                    request_sink.send(request).await?;
                 }
-
                 Ok(Some(ResolverVersion::Available(version)))
             }
         }
@@ -774,13 +878,13 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                             Some(url) => PubGrubDistribution::from_url(package_name, url),
                             None => PubGrubDistribution::from_registry(package_name, version),
                         };
-                        let package_id = dist.package_id();
+                        let version_id = dist.version_id();
 
                         // Wait for the metadata to be available.
                         self.index
                             .distributions
-                            .wait(&package_id)
-                            .instrument(info_span!("distributions_wait", %package_id))
+                            .wait(&version_id)
+                            .instrument(info_span!("distributions_wait", %version_id))
                             .await
                             .ok_or(ResolveError::Unregistered)?;
                     }
@@ -825,10 +929,15 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                     Some(url) => PubGrubDistribution::from_url(package_name, url),
                     None => PubGrubDistribution::from_registry(package_name, version),
                 };
-                let package_id = dist.package_id();
+                let version_id = dist.version_id();
 
-                // If the package does not exist in the registry, we cannot fetch its dependencies
-                if self.unavailable_packages.get(package_name).is_some() {
+                // If the package does not exist in the registry or locally, we cannot fetch its dependencies
+                if self.unavailable_packages.get(package_name).is_some()
+                    && self
+                        .installed_packages
+                        .get_packages(package_name)
+                        .is_empty()
+                {
                     debug_assert!(
                         false,
                         "Dependencies were requested for a package that is not available"
@@ -839,13 +948,66 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                 }
 
                 // Wait for the metadata to be available.
-                let metadata = self
+                let response = self
                     .index
                     .distributions
-                    .wait(&package_id)
-                    .instrument(info_span!("distributions_wait", %package_id))
+                    .wait(&version_id)
+                    .instrument(info_span!("distributions_wait", %version_id))
                     .await
                     .ok_or(ResolveError::Unregistered)?;
+
+                let metadata = match &*response {
+                    MetadataResponse::Found(archive) => &archive.metadata,
+                    MetadataResponse::Offline => {
+                        self.incomplete_packages
+                            .entry(package_name.clone())
+                            .or_default()
+                            .insert(version.clone(), IncompletePackage::Offline);
+                        return Ok(Dependencies::Unavailable(
+                            "network connectivity is disabled, but the metadata wasn't found in the cache"
+                                .to_string(),
+                        ));
+                    }
+                    MetadataResponse::InvalidMetadata(err) => {
+                        warn!("Unable to extract metadata for {package_name}: {err}");
+                        self.incomplete_packages
+                            .entry(package_name.clone())
+                            .or_default()
+                            .insert(
+                                version.clone(),
+                                IncompletePackage::InvalidMetadata(err.to_string()),
+                            );
+                        return Ok(Dependencies::Unavailable(
+                            "the package metadata could not be parsed".to_string(),
+                        ));
+                    }
+                    MetadataResponse::InconsistentMetadata(err) => {
+                        warn!("Unable to extract metadata for {package_name}: {err}");
+                        self.incomplete_packages
+                            .entry(package_name.clone())
+                            .or_default()
+                            .insert(
+                                version.clone(),
+                                IncompletePackage::InconsistentMetadata(err.to_string()),
+                            );
+                        return Ok(Dependencies::Unavailable(
+                            "the package metadata was inconsistent".to_string(),
+                        ));
+                    }
+                    MetadataResponse::InvalidStructure(err) => {
+                        warn!("Unable to extract metadata for {package_name}: {err}");
+                        self.incomplete_packages
+                            .entry(package_name.clone())
+                            .or_default()
+                            .insert(
+                                version.clone(),
+                                IncompletePackage::InvalidStructure(err.to_string()),
+                            );
+                        return Ok(Dependencies::Unavailable(
+                            "the package has an invalid format".to_string(),
+                        ));
+                    }
+                };
 
                 let mut constraints = PubGrubDependencies::from_requirements(
                     &metadata.requires_dist,
@@ -894,37 +1056,44 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                     trace!("Received package metadata for: {package_name}");
                     self.index.packages.done(package_name, version_map);
                 }
+                Some(Response::Installed { dist, metadata }) => {
+                    trace!("Received installed distribution metadata for: {dist}");
+                    self.index.distributions.done(
+                        dist.version_id(),
+                        MetadataResponse::Found(ArchiveMetadata::from(metadata)),
+                    );
+                }
                 Some(Response::Dist {
                     dist: Dist::Built(dist),
                     metadata,
-                    precise: _,
                 }) => {
                     trace!("Received built distribution metadata for: {dist}");
-                    self.index.distributions.done(dist.package_id(), metadata);
+                    match &metadata {
+                        MetadataResponse::InvalidMetadata(err) => {
+                            warn!("Unable to extract metadata for {dist}: {err}");
+                        }
+                        MetadataResponse::InvalidStructure(err) => {
+                            warn!("Unable to extract metadata for {dist}: {err}");
+                        }
+                        _ => {}
+                    }
+                    self.index.distributions.done(dist.version_id(), metadata);
                 }
                 Some(Response::Dist {
-                    dist: Dist::Source(distribution),
+                    dist: Dist::Source(dist),
                     metadata,
-                    precise,
                 }) => {
-                    trace!("Received source distribution metadata for: {distribution}");
-                    self.index
-                        .distributions
-                        .done(distribution.package_id(), metadata);
-                    if let Some(precise) = precise {
-                        match distribution {
-                            SourceDist::DirectUrl(sdist) => {
-                                self.index.redirects.insert(sdist.url.to_url(), precise);
-                            }
-                            SourceDist::Git(sdist) => {
-                                self.index.redirects.insert(sdist.url.to_url(), precise);
-                            }
-                            SourceDist::Path(sdist) => {
-                                self.index.redirects.insert(sdist.url.to_url(), precise);
-                            }
-                            SourceDist::Registry(_) => {}
+                    trace!("Received source distribution metadata for: {dist}");
+                    match &metadata {
+                        MetadataResponse::InvalidMetadata(err) => {
+                            warn!("Unable to extract metadata for {dist}: {err}");
                         }
+                        MetadataResponse::InvalidStructure(err) => {
+                            warn!("Unable to extract metadata for {dist}: {err}");
+                        }
+                        _ => {}
                     }
+                    self.index.distributions.done(dist.version_id(), metadata);
                 }
                 None => {}
             }
@@ -950,7 +1119,7 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
 
             // Fetch distribution metadata from the distribution database.
             Request::Dist(dist) => {
-                let (metadata, precise) = self
+                let metadata = self
                     .provider
                     .get_or_build_wheel_metadata(&dist)
                     .boxed()
@@ -967,11 +1136,14 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                             ResolveError::FetchAndBuild(Box::new(source_dist), err)
                         }
                     })?;
-                Ok(Some(Response::Dist {
-                    dist,
-                    metadata,
-                    precise,
-                }))
+                Ok(Some(Response::Dist { dist, metadata }))
+            }
+
+            Request::Installed(dist) => {
+                let metadata = dist
+                    .metadata()
+                    .map_err(|err| ResolveError::ReadInstalled(Box::new(dist.clone()), err))?;
+                Ok(Some(Response::Installed { dist, metadata }))
             }
 
             // Pre-fetch the package and distribution metadata.
@@ -1009,10 +1181,14 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
 
                 // Try to find a compatible version. If there aren't any compatible versions,
                 // short-circuit.
-                let Some(candidate) =
-                    self.selector
-                        .select(&package_name, &range, version_map, &self.preferences)
-                else {
+                let Some(candidate) = self.selector.select(
+                    &package_name,
+                    &range,
+                    version_map,
+                    &self.preferences,
+                    self.installed_packages,
+                    &self.exclusions,
+                ) else {
                     return Ok(None);
                 };
 
@@ -1022,34 +1198,41 @@ impl<'a, Provider: ResolverProvider> Resolver<'a, Provider> {
                 };
 
                 // Emit a request to fetch the metadata for this version.
-                if self.index.distributions.register(candidate.package_id()) {
-                    let dist = dist.for_resolution().clone();
+                if self.index.distributions.register(candidate.version_id()) {
+                    let dist = dist.for_resolution().to_owned();
 
-                    let (metadata, precise) = self
-                        .provider
-                        .get_or_build_wheel_metadata(&dist)
-                        .boxed()
-                        .await
-                        .map_err(|err| match dist.clone() {
-                            Dist::Built(BuiltDist::Path(built_dist)) => {
-                                ResolveError::Read(Box::new(built_dist), err)
-                            }
-                            Dist::Source(SourceDist::Path(source_dist)) => {
-                                ResolveError::Build(Box::new(source_dist), err)
-                            }
-                            Dist::Built(built_dist) => {
-                                ResolveError::Fetch(Box::new(built_dist), err)
-                            }
-                            Dist::Source(source_dist) => {
-                                ResolveError::FetchAndBuild(Box::new(source_dist), err)
-                            }
-                        })?;
+                    let response = match dist {
+                        ResolvedDist::Installable(dist) => {
+                            let metadata = self
+                                .provider
+                                .get_or_build_wheel_metadata(&dist)
+                                .boxed()
+                                .await
+                                .map_err(|err| match dist.clone() {
+                                    Dist::Built(BuiltDist::Path(built_dist)) => {
+                                        ResolveError::Read(Box::new(built_dist), err)
+                                    }
+                                    Dist::Source(SourceDist::Path(source_dist)) => {
+                                        ResolveError::Build(Box::new(source_dist), err)
+                                    }
+                                    Dist::Built(built_dist) => {
+                                        ResolveError::Fetch(Box::new(built_dist), err)
+                                    }
+                                    Dist::Source(source_dist) => {
+                                        ResolveError::FetchAndBuild(Box::new(source_dist), err)
+                                    }
+                                })?;
+                            Response::Dist { dist, metadata }
+                        }
+                        ResolvedDist::Installed(dist) => {
+                            let metadata = dist.metadata().map_err(|err| {
+                                ResolveError::ReadInstalled(Box::new(dist.clone()), err)
+                            })?;
+                            Response::Installed { dist, metadata }
+                        }
+                    };
 
-                    Ok(Some(Response::Dist {
-                        dist,
-                        metadata,
-                        precise,
-                    }))
+                    Ok(Some(response))
                 } else {
                     Ok(None)
                 }
@@ -1087,6 +1270,8 @@ pub(crate) enum Request {
     Package(PackageName),
     /// A request to fetch the metadata for a built or source distribution.
     Dist(Dist),
+    /// A request to fetch the metadata from an already-installed distribution.
+    Installed(InstalledDist),
     /// A request to pre-fetch the metadata for a package and the best-guess distribution.
     Prefetch(PackageName, Range<Version>),
 }
@@ -1099,6 +1284,9 @@ impl Display for Request {
             }
             Self::Dist(dist) => {
                 write!(f, "Metadata {dist}")
+            }
+            Self::Installed(dist) => {
+                write!(f, "Installed metadata {dist}")
             }
             Self::Prefetch(package_name, range) => {
                 write!(f, "Prefetch {package_name} {range}")
@@ -1115,8 +1303,12 @@ enum Response {
     /// The returned metadata for a distribution.
     Dist {
         dist: Dist,
+        metadata: MetadataResponse,
+    },
+    /// The returned metadata for an already-installed distribution.
+    Installed {
+        dist: InstalledDist,
         metadata: Metadata23,
-        precise: Option<Url>,
     },
 }
 

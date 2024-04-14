@@ -1,12 +1,10 @@
-use dashmap::DashMap;
-use url::Url;
+use std::sync::Arc;
 
-use distribution_types::PackageId;
+use distribution_types::VersionId;
 use once_map::OnceMap;
-use pypi_types::Metadata23;
 use uv_normalize::PackageName;
 
-use super::provider::VersionsResponse;
+use crate::resolver::provider::{MetadataResponse, VersionsResponse};
 
 /// In-memory index of package metadata.
 #[derive(Default)]
@@ -16,10 +14,27 @@ pub struct InMemoryIndex {
     pub(crate) packages: OnceMap<PackageName, VersionsResponse>,
 
     /// A map from package ID to metadata for that distribution.
-    pub(crate) distributions: OnceMap<PackageId, Metadata23>,
+    pub(crate) distributions: OnceMap<VersionId, MetadataResponse>,
+}
 
-    /// A map from source URL to precise URL. For example, the source URL
-    /// `git+https://github.com/pallets/flask.git` could be redirected to
-    /// `git+https://github.com/pallets/flask.git@c2f65dd1cfff0672b902fd5b30815f0b4137214c`.
-    pub(crate) redirects: DashMap<Url, Url>,
+impl InMemoryIndex {
+    /// Insert a [`VersionsResponse`] into the index.
+    pub fn insert_package(&self, package_name: PackageName, response: VersionsResponse) {
+        self.packages.done(package_name, response);
+    }
+
+    /// Insert a [`Metadata23`] into the index.
+    pub fn insert_metadata(&self, version_id: VersionId, response: MetadataResponse) {
+        self.distributions.done(version_id, response);
+    }
+
+    /// Get the [`VersionsResponse`] for a given package name, without waiting.
+    pub fn get_package(&self, package_name: &PackageName) -> Option<Arc<VersionsResponse>> {
+        self.packages.get(package_name)
+    }
+
+    /// Get the [`MetadataResponse`] for a given package ID, without waiting.
+    pub fn get_metadata(&self, version_id: &VersionId) -> Option<Arc<MetadataResponse>> {
+        self.distributions.get(version_id)
+    }
 }

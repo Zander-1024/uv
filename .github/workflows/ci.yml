@@ -31,7 +31,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: "Prettier"
-        run: npx prettier --check "**/*.{yaml,yml}"
+        run: npx prettier --check "**/*.{json5,yaml,yml}"
 
       - name: "Ruff format"
         run: pipx run ruff format --diff .
@@ -72,33 +72,22 @@ jobs:
     name: "cargo test | ${{ matrix.os }}"
     steps:
       - uses: actions/checkout@v4
-
-      - if: ${{ matrix.os == 'macos' }}
-        name: "Install bootstrap dependencies"
-        run: brew install coreutils
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: "Install pipx"
-        run: pip install pipx
-
-      - name: "Install required Python versions"
-        run: pipx run scripts/bootstrap/install.py
-
       - name: "Install Rust toolchain"
         run: rustup show
-
-      - name: "Install cargo nextest"
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
 
       - if: ${{ matrix.os != 'windows' }}
         uses: rui314/setup-mold@v1
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: "Install required Python versions"
+        run: |
+          cargo run -p uv-dev -- fetch-python
+
+      - name: "Install cargo nextest"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
       - name: "Cargo test"
         run: |
@@ -225,16 +214,98 @@ jobs:
           path: ./target/debug/uv.exe
           retention-days: 1
 
+  ecosystem-test:
+    needs: build-binary-linux
+    name: "ecosystem test | ${{ matrix.repo }}"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - repo: "prefecthq/prefect"
+            command: "uv pip install -e '.[dev]'"
+            python: "3.9"
+          - repo: "pallets/flask"
+            command: "uv pip install -r requirements/dev.txt"
+            python: "3.12"
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: "Download binary"
+        uses: actions/download-artifact@v4
+        with:
+          name: uv-linux-${{ github.sha }}
+
+      - name: "Prepare binary"
+        run: chmod +x ./uv
+
+      - name: "Test"
+        run: |
+          ./uv venv
+          ./${{ matrix.command }}
+
+  cache-test-ubuntu:
+    needs: build-binary-linux
+    name: "check cache | ubuntu"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Download binary"
+        uses: actions/download-artifact@v4
+        with:
+          name: uv-linux-${{ github.sha }}
+
+      - name: "Prepare binary"
+        run: chmod +x ./uv
+
+      - name: "Download binary for last version"
+        run: curl -LsSf "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz" | tar -xvz
+
+      - name: "Check cache compatibility"
+        run: python scripts/check_cache_compat.py --uv-current ./uv --uv-previous ./uv-x86_64-unknown-linux-gnu/uv
+
+  cache-test-macos-aarch64:
+    needs: build-binary-macos-aarch64
+    name: "check cache | macos aarch64"
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Download binary"
+        uses: actions/download-artifact@v4
+        with:
+          name: uv-macos-aarch64-${{ github.sha }}
+
+      - name: "Prepare binary"
+        run: chmod +x ./uv
+
+      - name: "Download binary for last version"
+        run: curl -LsSf "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-apple-darwin.tar.gz" | tar -xvz
+
+      - name: "Check cache compatibility"
+        run: python scripts/check_cache_compat.py --uv-current ./uv --uv-previous ./uv-aarch64-apple-darwin/uv
+
   system-test-debian:
     needs: build-binary-linux
     name: "check system | python on debian"
     runs-on: ubuntu-latest
-    container: debian:bullseye
+    container: debian:bookworm
     steps:
       - uses: actions/checkout@v4
 
       - name: "Install Python"
-        run: apt-get update && apt-get install -y python3.9 python3-pip python3.9-venv
+        run: apt-get update && apt-get install -y python3.11 python3-pip python3.11-venv
 
       - name: "Download binary"
         uses: actions/download-artifact@v4
@@ -245,16 +316,16 @@ jobs:
         run: chmod +x ./uv
 
       - name: "Print Python path"
-        run: echo $(which python3.9)
+        run: echo $(which python3.11)
 
       - name: "Validate global Python install"
-        run: python3.9 scripts/check_system_python.py --uv ./uv
+        run: python3.11 scripts/check_system_python.py --uv ./uv --externally-managed
 
   system-test-fedora:
     needs: build-binary-linux
     name: "check system | python on fedora"
     runs-on: ubuntu-latest
-    container: fedora:39
+    container: fedora:41
     steps:
       - uses: actions/checkout@v4
 
@@ -300,19 +371,44 @@ jobs:
       - name: "Validate global Python install"
         run: python scripts/check_system_python.py --uv ./uv
 
-  system-test-centos:
+  system-test-opensuse:
     needs: build-binary-linux
-    name: "check system | python on centos"
+    name: "check system | python on opensuse"
     runs-on: ubuntu-latest
-    container: centos:8
+    container: opensuse/tumbleweed
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Install Python"
+        run: zypper install -y python310 which && python3.10 -m ensurepip && mv /usr/bin/python3.10 /usr/bin/python3
+
+      - name: "Download binary"
+        uses: actions/download-artifact@v4
+        with:
+          name: uv-linux-${{ github.sha }}
+
+      - name: "Prepare binary"
+        run: chmod +x ./uv
+
+      - name: "Print Python path"
+        run: echo $(which python3)
+
+      - name: "Validate global Python install"
+        run: python3 scripts/check_system_python.py --uv ./uv
+
+  # Note: rockylinux:8 is a 1-1 code compatible distro to rhel-8
+  # rockylinux:8 mimics centos-8 but with added maintenance stability
+  # and avoids issues with centos stream uptime concerns
+  system-test-rocky-linux:
+    needs: build-binary-linux
+    name: "check system | python on rocky linux"
+    runs-on: ubuntu-latest
+    container: rockylinux:8
     steps:
       - uses: actions/checkout@v4
 
       - name: "Install Python"
         run: |
-          # Add CentOS stream repositories, you cannot install from the EOL CentOS 8 mirrors
-          dnf -y --disablerepo '*' --enablerepo extras swap centos-linux-repos centos-stream-repos
-          # `python` gives you `python3.6` which we do not support
           dnf install python39 python39-pip which -y
 
       - name: "Download binary"
@@ -408,8 +504,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: "Download binary"
+        uses: actions/download-artifact@v4
+        with:
+          name: uv-macos-aarch64-${{ github.sha }}
+
+      - name: "Prepare binary"
+        run: chmod +x ./uv
+
+      # This should be the macOS system Python
+      # We'd like to test with Homebrew but this Python takes precedence in system Python discovery
+      - name: "Print Python path"
+        run: echo $(which python3)
+
+      - name: "Validate global Python install"
+        run: python3 scripts/check_system_python.py --uv ./uv --externally-managed
+
+  system-test-macos-aarch64-homebrew:
+    needs: build-binary-macos-aarch64
+    name: "check system | homebrew python on macos aarch64"
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
       - name: "Install Python"
-        run: brew install python@3.8
+        run: brew install python3
 
       - name: "Download binary"
         uses: actions/download-artifact@v4
@@ -423,7 +542,7 @@ jobs:
         run: echo $(which python3)
 
       - name: "Validate global Python install"
-        run: python3 scripts/check_system_python.py --uv ./uv
+        run: python3 scripts/check_system_python.py --uv ./uv --externally-managed
 
   system-test-macos-x86_64:
     needs: build-binary-macos-x86_64

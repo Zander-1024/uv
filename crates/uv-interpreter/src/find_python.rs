@@ -6,11 +6,11 @@ use std::path::PathBuf;
 use tracing::{debug, instrument};
 
 use uv_cache::Cache;
-use uv_fs::normalize_path;
+use uv_toolchain::PythonVersion;
 
 use crate::interpreter::InterpreterInfoError;
 use crate::python_environment::{detect_python_executable, detect_virtual_env};
-use crate::{Error, Interpreter, PythonVersion};
+use crate::{Error, Interpreter};
 
 /// Find a Python of a specific version, a binary with a name or a path to a binary.
 ///
@@ -51,8 +51,7 @@ pub fn find_requested_python(request: &str, cache: &Cache) -> Result<Option<Inte
         Interpreter::query(executable, cache).map(Some)
     } else {
         // `-p /home/ferris/.local/bin/python3.10`
-        let executable = normalize_path(request);
-
+        let executable = uv_fs::absolutize_path(request.as_ref())?;
         Interpreter::query(executable, cache).map(Some)
     }
 }
@@ -464,7 +463,7 @@ fn find_version(
     let version_matches = |interpreter: &Interpreter| -> bool {
         if let Some(python_version) = python_version {
             // If a patch version was provided, check for an exact match
-            python_version.is_satisfied_by(interpreter)
+            interpreter.satisfies(python_version)
         } else {
             // The version always matches if one was not provided
             true

@@ -14,14 +14,15 @@ use distribution_types::{IndexLocations, Resolution, SourceDist};
 use pep508_rs::{MarkerEnvironment, Requirement, StringVersion};
 use platform_tags::{Arch, Os, Platform, Tags};
 use uv_cache::Cache;
-use uv_client::{FlatIndex, RegistryClientBuilder};
+use uv_client::RegistryClientBuilder;
+use uv_configuration::{BuildKind, Constraints, NoBinary, NoBuild, Overrides, SetupPyStrategy};
 use uv_interpreter::{find_default_python, Interpreter, PythonEnvironment};
 use uv_resolver::{
-    DisplayResolutionGraph, InMemoryIndex, Manifest, Options, OptionsBuilder, PreReleaseMode,
-    Preference, ResolutionGraph, ResolutionMode, Resolver,
+    DisplayResolutionGraph, Exclusions, FlatIndex, InMemoryIndex, Manifest, Options,
+    OptionsBuilder, PreReleaseMode, Preference, ResolutionGraph, ResolutionMode, Resolver,
 };
 use uv_types::{
-    BuildContext, BuildIsolation, BuildKind, NoBinary, NoBuild, SetupPyStrategy, SourceBuildTrait,
+    BuildContext, BuildIsolation, EmptyInstalledPackages, HashStrategy, SourceBuildTrait,
 };
 
 // Exclude any packages uploaded after this date.
@@ -124,6 +125,8 @@ async fn resolve(
         find_default_python(&Cache::temp().unwrap()).expect("Expected a python to be installed");
     let interpreter = Interpreter::artificial(real_interpreter.platform().clone(), markers.clone());
     let build_context = DummyContext::new(Cache::temp()?, interpreter.clone());
+    let hashes = HashStrategy::None;
+    let installed_packages = EmptyInstalledPackages;
     let resolver = Resolver::new(
         manifest,
         options,
@@ -133,7 +136,9 @@ async fn resolve(
         &client,
         &flat_index,
         &index,
+        &hashes,
         &build_context,
+        &installed_packages,
     )?;
     Ok(resolver.resolve().await?)
 }
@@ -266,11 +271,14 @@ async fn black_python_310() -> Result<()> {
 async fn black_mypy_extensions() -> Result<()> {
     let manifest = Manifest::new(
         vec![Requirement::from_str("black<=23.9.1").unwrap()],
-        vec![Requirement::from_str("mypy-extensions<0.4.4").unwrap()],
-        vec![],
+        Constraints::from_requirements(vec![
+            Requirement::from_str("mypy-extensions<0.4.4").unwrap()
+        ]),
+        Overrides::default(),
         vec![],
         None,
         vec![],
+        Exclusions::default(),
         vec![],
     );
     let options = OptionsBuilder::new()
@@ -302,11 +310,14 @@ async fn black_mypy_extensions() -> Result<()> {
 async fn black_mypy_extensions_extra() -> Result<()> {
     let manifest = Manifest::new(
         vec![Requirement::from_str("black<=23.9.1").unwrap()],
-        vec![Requirement::from_str("mypy-extensions[extra]<0.4.4").unwrap()],
-        vec![],
+        Constraints::from_requirements(vec![
+            Requirement::from_str("mypy-extensions[extra]<0.4.4").unwrap()
+        ]),
+        Overrides::default(),
         vec![],
         None,
         vec![],
+        Exclusions::default(),
         vec![],
     );
     let options = OptionsBuilder::new()
@@ -338,11 +349,12 @@ async fn black_mypy_extensions_extra() -> Result<()> {
 async fn black_flake8() -> Result<()> {
     let manifest = Manifest::new(
         vec![Requirement::from_str("black<=23.9.1").unwrap()],
-        vec![Requirement::from_str("flake8<1").unwrap()],
-        vec![],
+        Constraints::from_requirements(vec![Requirement::from_str("flake8<1").unwrap()]),
+        Overrides::default(),
         vec![],
         None,
         vec![],
+        Exclusions::default(),
         vec![],
     );
     let options = OptionsBuilder::new()
@@ -426,15 +438,17 @@ async fn black_lowest_direct() -> Result<()> {
 async fn black_respect_preference() -> Result<()> {
     let manifest = Manifest::new(
         vec![Requirement::from_str("black<=23.9.1")?],
-        vec![],
-        vec![],
+        Constraints::default(),
+        Overrides::default(),
         vec![Preference::from_requirement(Requirement::from_str(
             "black==23.9.0",
         )?)],
         None,
         vec![],
+        Exclusions::default(),
         vec![],
     );
+
     let options = OptionsBuilder::new()
         .exclude_newer(Some(*EXCLUDE_NEWER))
         .build();
@@ -462,13 +476,14 @@ async fn black_respect_preference() -> Result<()> {
 async fn black_ignore_preference() -> Result<()> {
     let manifest = Manifest::new(
         vec![Requirement::from_str("black<=23.9.1")?],
-        vec![],
-        vec![],
+        Constraints::default(),
+        Overrides::default(),
         vec![Preference::from_requirement(Requirement::from_str(
             "black==23.9.2",
         )?)],
         None,
         vec![],
+        Exclusions::default(),
         vec![],
     );
     let options = OptionsBuilder::new()
@@ -685,6 +700,7 @@ static TAGS_311: Lazy<Tags> = Lazy::new(|| {
         (3, 11),
         "cpython",
         (3, 11),
+        false,
     )
     .unwrap()
 });
@@ -717,6 +733,7 @@ static TAGS_310: Lazy<Tags> = Lazy::new(|| {
         (3, 10),
         "cpython",
         (3, 10),
+        false,
     )
     .unwrap()
 });

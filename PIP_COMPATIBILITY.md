@@ -30,48 +30,13 @@ drawbacks:
    target tool the user is expecting to use.
 4. It prevents uv from introducing any settings or configuration that don't exist in the target
    tool, since otherwise `pip.conf` (or similar) would no longer be usable with `pip`.
-5. It can lead user confusion, since uv would be reading settings that don't actually affect its
+5. It can lead to user confusion, since uv would be reading settings that don't actually affect its
    behavior, and many users may _not_ expect uv to read configuration files intended for other
    tools.
 
 Instead, uv supports its own environment variables, like `UV_INDEX_URL`. In the future, uv will
 also support persistent configuration in its own configuration file format (e.g., `pyproject.toml`
 or `uv.toml` or similar). For more, see [#651](https://github.com/astral-sh/uv/issues/651).
-
-## Transitive direct URL dependencies
-
-While uv does support direct URL dependencies (e.g., `black @ https://...`), it does not support
-nested (or "transitive") direct URL dependencies, instead requiring that any direct URL dependencies
-are declared upfront.
-
-For example, if `black @ https://...` itself had a dependency on `toml @ https://...`, uv would
-reject the transitive direct URL dependency on `toml` and require that `toml` be declared as a
-dependency in the `pyproject.toml` file, like:
-
-```toml
-# pyproject.toml
-dependencies = [
-    "black @ https://...",
-    "toml @ https://...",
-]
-```
-
-This is a deliberate choice to avoid the correctness and security issues associated with allowing
-transitive dependencies to introduce arbitrary URLs into the dependency graph.
-
-For example:
-
-- Your package depends on `package_a==1.0.0`.
-- Your package depends on `package_b==1.0.0`.
-- `package_b==1.0.0` depends on `package_a @ https://...`.
-
-If `package_a @ https://...` happens to resolve to version `1.0.0`, `pip` would install `package_a`
-from the direct URL. This is a security issue, since the direct URL could be controlled by an
-attacker, and a correctness issue, since the direct URL could resolve to an entirely different
-package with the same name and version.
-
-In the future, uv may allow transitive URL dependencies in some form (e.g., with user opt-in).
-For more, see [#1808](https://github.com/astral-sh/uv/issues/1808).
 
 ## Pre-release compatibility
 
@@ -142,7 +107,7 @@ the available versions of a given package. However, uv and `pip` differ in how t
 packages that exist on multiple indexes.
 
 For example, imagine that a company publishes an internal version of `requests` on a private index
-(`--extra-index-url`), but also allow installing packages from PyPI by default. In this case, the
+(`--extra-index-url`), but also allows installing packages from PyPI by default. In this case, the
 private `requests` would conflict with the public [`requests`](https://pypi.org/project/requests/)
 on PyPI.
 
@@ -152,7 +117,7 @@ finds a match. This means that if a package exists on multiple indexes, uv will 
 candidate versions to those present in the first index that contains the package.
 
 `pip`, meanwhile, will combine the candidate versions from all indexes, and select the best
-version from the combined set., though it makes [no guarantees around the order](https://github.com/pypa/pip/issues/5045#issuecomment-369521345)
+version from the combined set, though it makes [no guarantees around the order](https://github.com/pypa/pip/issues/5045#issuecomment-369521345)
 in which it searches indexes, and expects that packages are unique up to name and version, even
 across indexes.
 
@@ -163,9 +128,32 @@ internal package, thus causing the malicious package to be installed instead of 
 package. See, for example, [the `torchtriton` attack](https://pytorch.org/blog/compromised-nightly-dependency/)
 from December 2022.
 
+As of v0.1.29, users can opt in to `pip`-style behavior for multiple indexes via the
+`--index-strategy unsafe-any-match` command-line option, or the `UV_INDEX_STRATEGY` environment
+variable. When enabled, uv will search for each package across all indexes, and consider all
+available versions when resolving dependencies, prioritizing the `--extra-index-url` indexes over
+the default index URL. (Versions that are duplicated _across_ indexes will be ignored.)
+
 In the future, uv will support pinning packages to dedicated indexes (see: [#171](https://github.com/astral-sh/uv/issues/171)).
 Additionally, [PEP 708](https://peps.python.org/pep-0708/) is a provisional standard that aims to
 address the "dependency confusion" issue across package registries and installers.
+
+## Transitive direct URL dependencies for constraints and overrides
+
+While uv does support URL dependencies (e.g., `black @ https://...`), it does not support
+_transitive_ (i.e., "nested") direct URL dependencies for constraints and overrides.
+
+Specifically, if a constraint or override is defined using a direct URL dependency, and the
+constrained package has a direct URL dependency of its own, uv _may_ reject that transitive direct
+URL dependency during resolution.
+
+uv also makes the assumption that non-URL dependencies won't introduce URL dependencies (i.e., that
+dependencies fetched from a registry will not themselves have direct URL dependencies). If a non-URL
+dependency _does_ introduce a URL dependency, uv will reject the URL dependency during resolution.
+
+If uv rejects a transitive URL dependency in either case, the best course of action is to provide
+the URL dependency as a direct dependency in the `requirements.in` file, rather than as a
+constraint, override, or transitive dependency.
 
 ## Virtual environments by default
 
@@ -270,14 +258,6 @@ typing-extensions==4.10.0
 When uv resolutions differ from `pip` in undesirable ways, it's often a sign that the specifiers
 are too loose, and that the user should consider tightening them. For example, in the case of
 `starlette` and `fastapi`, the user could require `fastapi>=0.110.0`.
-
-## Hash-checking mode
-
-While uv will include hashes via `uv pip compile --generate-hashes`, it does not support
-hash-checking mode, which is a feature of `pip` that allows users to verify the integrity of
-downloaded packages by checking their hashes against those provided in the `requirements.txt` file.
-
-In the future, uv will support hash-checking mode. For more, see [#474](https://github.com/astral-sh/uv/issues/474).
 
 ## `pip check`
 

@@ -1,9 +1,9 @@
 //! DO NOT EDIT
 //!
-//! Generated with ./scripts/scenarios/sync.sh
-//! Scenarios from <https://github.com/zanieb/packse/tree/0.3.12/scenarios>
+//! Generated with `./scripts/sync_scenarios.sh`
+//! Scenarios from <https://github.com/astral-sh/packse/tree/0.3.14/scenarios>
 //!
-#![cfg(all(feature = "python", feature = "pypi"))]
+#![cfg(all(feature = "python", feature = "pypi", unix))]
 
 use std::path::Path;
 use std::process::Command;
@@ -46,9 +46,9 @@ fn command(context: &TestContext) -> Command {
         .arg("pip")
         .arg("install")
         .arg("--index-url")
-        .arg("https://astral-sh.github.io/packse/0.3.12/simple-html/")
+        .arg("https://astral-sh.github.io/packse/0.3.14/simple-html/")
         .arg("--find-links")
-        .arg("https://raw.githubusercontent.com/zanieb/packse/0.3.12/vendor/links.html")
+        .arg("https://raw.githubusercontent.com/astral-sh/packse/0.3.14/vendor/links.html")
         .arg("--cache-dir")
         .arg(context.cache_dir.path())
         .env("VIRTUAL_ENV", context.venv.as_os_str())
@@ -708,6 +708,7 @@ fn missing_extra() {
 
     ----- stderr -----
     Resolved 1 package in [TIME]
+    warning: The package `package-a==1.0.0` does not have an extra named `extra`.
     Downloaded 1 package in [TIME]
     Installed 1 package in [TIME]
      + package-a==1.0.0
@@ -1080,6 +1081,7 @@ fn extra_does_not_exist_backtrack() {
 
     ----- stderr -----
     Resolved 1 package in [TIME]
+    warning: The package `package-a==3.0.0` does not have an extra named `extra`.
     Downloaded 1 package in [TIME]
     Installed 1 package in [TIME]
      + package-a==3.0.0
@@ -1750,7 +1752,7 @@ fn local_transitive_confounding() {
           And because only package-a==1.0.0 is available and you require package-a, we can conclude that the requirements are unsatisfiable.
     "###);
 
-    // The version '1.2.3+foo' satisfies the constraint '==1.2.3'.
+    // The version '2.0.0+foo' satisfies the constraint '==2.0.0'.
     assert_not_installed(
         &context.venv,
         "local_transitive_confounding_a",
@@ -3669,7 +3671,7 @@ fn python_version_does_not_exist() {
 
     ----- stderr -----
       × No solution found when resolving dependencies:
-      ╰─▶ Because the current Python version (3.8.18) does not satisfy Python>=3.30 and package-a==1.0.0 depends on Python>=3.30, we can conclude that package-a==1.0.0 cannot be used.
+      ╰─▶ Because the current Python version (3.8.[X]) does not satisfy Python>=3.30 and package-a==1.0.0 depends on Python>=3.30, we can conclude that package-a==1.0.0 cannot be used.
           And because you require package-a==1.0.0, we can conclude that the requirements are unsatisfiable.
     "###);
 
@@ -3711,7 +3713,7 @@ fn python_less_than_current() {
 
     ----- stderr -----
       × No solution found when resolving dependencies:
-      ╰─▶ Because the current Python version (3.9.18) does not satisfy Python<=3.8 and package-a==1.0.0 depends on Python<=3.8, we can conclude that package-a==1.0.0 cannot be used.
+      ╰─▶ Because the current Python version (3.9.[X]) does not satisfy Python<=3.8 and package-a==1.0.0 depends on Python<=3.8, we can conclude that package-a==1.0.0 cannot be used.
           And because you require package-a==1.0.0, we can conclude that the requirements are unsatisfiable.
     "###);
 
@@ -3753,7 +3755,7 @@ fn python_greater_than_current() {
 
     ----- stderr -----
       × No solution found when resolving dependencies:
-      ╰─▶ Because the current Python version (3.9.18) does not satisfy Python>=3.10 and package-a==1.0.0 depends on Python>=3.10, we can conclude that package-a==1.0.0 cannot be used.
+      ╰─▶ Because the current Python version (3.9.[X]) does not satisfy Python>=3.10 and package-a==1.0.0 depends on Python>=3.10, we can conclude that package-a==1.0.0 cannot be used.
           And because you require package-a==1.0.0, we can conclude that the requirements are unsatisfiable.
     "###);
 
@@ -3778,6 +3780,7 @@ fn python_greater_than_current() {
 ///     └── a-1.0.0
 ///         └── requires python>=3.8.14 (incompatible with environment)
 /// ```
+#[cfg(feature = "python-patch")]
 #[test]
 fn python_greater_than_current_patch() {
     let context = TestContext::new("3.8.12");
@@ -3959,22 +3962,22 @@ fn python_greater_than_current_excluded() {
 
     ----- stderr -----
       × No solution found when resolving dependencies:
-      ╰─▶ Because the current Python version (3.9.18) does not satisfy Python>=3.10,<3.11 and the current Python version (3.9.18) does not satisfy Python>=3.12, we can conclude that any of:
+      ╰─▶ Because the current Python version (3.9.[X]) does not satisfy Python>=3.10,<3.11 and the current Python version (3.9.[X]) does not satisfy Python>=3.12, we can conclude that any of:
               Python>=3.10,<3.11
               Python>=3.12
            are incompatible.
-          And because the current Python version (3.9.18) does not satisfy Python>=3.11,<3.12, we can conclude that Python>=3.10 are incompatible.
+          And because the current Python version (3.9.[X]) does not satisfy Python>=3.11,<3.12, we can conclude that Python>=3.10 are incompatible.
           And because package-a==2.0.0 depends on Python>=3.10 and only the following versions of package-a are available:
               package-a<=2.0.0
               package-a==3.0.0
               package-a==4.0.0
           we can conclude that package-a>=2.0.0,<3.0.0 cannot be used. (1)
 
-          Because the current Python version (3.9.18) does not satisfy Python>=3.11,<3.12 and the current Python version (3.9.18) does not satisfy Python>=3.12, we can conclude that Python>=3.11 are incompatible.
+          Because the current Python version (3.9.[X]) does not satisfy Python>=3.11,<3.12 and the current Python version (3.9.[X]) does not satisfy Python>=3.12, we can conclude that Python>=3.11 are incompatible.
           And because package-a==3.0.0 depends on Python>=3.11, we can conclude that package-a==3.0.0 cannot be used.
           And because we know from (1) that package-a>=2.0.0,<3.0.0 cannot be used, we can conclude that package-a>=2.0.0,<4.0.0 cannot be used. (2)
 
-          Because the current Python version (3.9.18) does not satisfy Python>=3.12 and package-a==4.0.0 depends on Python>=3.12, we can conclude that package-a==4.0.0 cannot be used.
+          Because the current Python version (3.9.[X]) does not satisfy Python>=3.12 and package-a==4.0.0 depends on Python>=3.12, we can conclude that package-a==4.0.0 cannot be used.
           And because we know from (2) that package-a>=2.0.0,<4.0.0 cannot be used, we can conclude that package-a>=2.0.0 cannot be used.
           And because you require package-a>=2.0.0, we can conclude that the requirements are unsatisfiable.
     "###);

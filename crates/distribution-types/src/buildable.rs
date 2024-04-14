@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use pep440_rs::Version;
 use url::Url;
 
 use uv_normalize::PackageName;
@@ -24,6 +25,15 @@ impl BuildableSource<'_> {
     pub fn name(&self) -> Option<&PackageName> {
         match self {
             Self::Dist(dist) => Some(dist.name()),
+            Self::Url(_) => None,
+        }
+    }
+
+    /// Return the [`Version`] of the source, if available.
+    pub fn version(&self) -> Option<&Version> {
+        match self {
+            Self::Dist(SourceDist::Registry(dist)) => Some(&dist.filename.version),
+            Self::Dist(_) => None,
             Self::Url(_) => None,
         }
     }
@@ -52,6 +62,17 @@ pub enum SourceUrl<'a> {
     Direct(DirectSourceUrl<'a>),
     Git(GitSourceUrl<'a>),
     Path(PathSourceUrl<'a>),
+}
+
+impl<'a> SourceUrl<'a> {
+    /// Return the [`Url`] of the source.
+    pub fn url(&self) -> &Url {
+        match self {
+            Self::Direct(dist) => dist.url,
+            Self::Git(dist) => dist.url,
+            Self::Path(dist) => dist.url,
+        }
+    }
 }
 
 impl std::fmt::Display for SourceUrl<'_> {

@@ -1,5 +1,7 @@
 #![cfg(all(feature = "python", feature = "pypi"))]
 
+use std::process::Command;
+
 use anyhow::Result;
 use assert_cmd::prelude::*;
 use assert_fs::prelude::*;
@@ -7,12 +9,10 @@ use base64::{prelude::BASE64_STANDARD as base64, Engine};
 use indoc::indoc;
 use itertools::Itertools;
 
-use std::process::Command;
-
-use common::{uv_snapshot, TestContext, EXCLUDE_NEWER};
+use common::{uv_snapshot, TestContext};
 use uv_fs::Simplified;
 
-use crate::common::get_bin;
+use crate::common::{get_bin, BUILD_VENDOR_LINKS_URL};
 
 mod common;
 
@@ -32,38 +32,6 @@ fn decode_token(content: &[&str]) -> String {
         .map(|decoded| std::str::from_utf8(decoded.as_slice()).unwrap().to_string())
         .join("_");
     token
-}
-
-/// Create a `pip install` command with options shared across scenarios.
-fn command(context: &TestContext) -> Command {
-    let mut command = command_without_exclude_newer(context);
-    command.arg("--exclude-newer").arg(EXCLUDE_NEWER);
-    command
-}
-
-/// Create a `pip install` command with no `--exclude-newer` option.
-///
-/// One should avoid using this in tests to the extent possible because
-/// it can result in tests failing when the index state changes. Therefore,
-/// if you use this, there should be some other kind of mitigation in place.
-/// For example, pinning package versions.
-fn command_without_exclude_newer(context: &TestContext) -> Command {
-    let mut command = Command::new(get_bin());
-    command
-        .arg("pip")
-        .arg("install")
-        .arg("--cache-dir")
-        .arg(context.cache_dir.path())
-        .env("VIRTUAL_ENV", context.venv.as_os_str())
-        .current_dir(&context.temp_dir);
-
-    if cfg!(all(windows, debug_assertions)) {
-        // TODO(konstin): Reduce stack usage in debug mode enough that the tests pass with the
-        // default windows stack of 1MB
-        command.env("UV_STACK_SIZE", (2 * 1024 * 1024).to_string());
-    }
-
-    command
 }
 
 /// Create a `pip uninstall` command with options shared across scenarios.
@@ -91,7 +59,7 @@ fn missing_requirements_txt() {
     let context = TestContext::new("3.12");
     let requirements_txt = context.temp_dir.child("requirements.txt");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -114,7 +82,7 @@ fn empty_requirements_txt() -> Result<()> {
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.touch()?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -135,7 +103,7 @@ fn empty_requirements_txt() -> Result<()> {
 fn missing_pyproject_toml() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("pyproject.toml"), @r###"
     success: false
@@ -155,7 +123,7 @@ fn invalid_pyproject_toml_syntax() -> Result<()> {
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str("123 - 456")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("pyproject.toml"), @r###"
     success: false
@@ -182,7 +150,7 @@ fn invalid_pyproject_toml_schema() -> Result<()> {
     let pyproject_toml = context.temp_dir.child("pyproject.toml");
     pyproject_toml.write_str("[project]")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("pyproject.toml"), @r###"
     success: false
@@ -219,7 +187,7 @@ dependencies = ["flask==1.0.x"]
         .chain(context.filters())
         .collect::<Vec<_>>();
 
-    uv_snapshot!(filters, command(&context)
+    uv_snapshot!(filters, context.install()
         .arg("-r")
         .arg("pyproject.toml"), @r###"
     success: false
@@ -289,7 +257,7 @@ dependencies = ["flask==1.0.x"]
 fn no_solution() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("flask>=3.0.2")
         .arg("WerkZeug<1.0.0")
         .arg("--strict"), @r###"
@@ -299,11 +267,8 @@ fn no_solution() {
 
     ----- stderr -----
       × No solution found when resolving dependencies:
-      ╰─▶ Because only flask<=3.0.2 is available and flask==3.0.2 depends
-          on werkzeug>=3.0.0, we can conclude that flask>=3.0.2 depends on
-          werkzeug>=3.0.0.
-          And because you require flask>=3.0.2 and you require werkzeug<1.0.0, we
-          can conclude that the requirements are unsatisfiable.
+      ╰─▶ Because only flask<=3.0.2 is available and flask==3.0.2 depends on werkzeug>=3.0.0, we can conclude that flask>=3.0.2 depends on werkzeug>=3.0.0.
+          And because you require flask>=3.0.2 and you require werkzeug<1.0.0, we can conclude that the requirements are unsatisfiable.
     "###);
 }
 
@@ -313,7 +278,7 @@ fn install_package() {
     let context = TestContext::new("3.12");
 
     // Install Flask.
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("Flask")
         .arg("--strict"), @r###"
     success: true
@@ -346,7 +311,7 @@ fn install_requirements_txt() -> Result<()> {
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str("Flask")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -374,7 +339,7 @@ fn install_requirements_txt() -> Result<()> {
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str("Jinja2")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -392,6 +357,55 @@ fn install_requirements_txt() -> Result<()> {
     Ok(())
 }
 
+/// Install a `pyproject.toml` file with a `poetry` section.
+#[test]
+fn install_pyproject_toml_poetry() -> Result<()> {
+    let context = TestContext::new("3.12");
+    let pyproject_toml = context.temp_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"[tool.poetry]
+name = "poetry-editable"
+version = "0.1.0"
+description = ""
+authors = ["Astral Software Inc. <hey@astral.sh>"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+anyio = "^3"
+iniconfig = { version = "*", optional = true }
+
+[tool.poetry.extras]
+test = ["iniconfig"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+"#,
+    )?;
+
+    uv_snapshot!(context.install()
+            .arg("-r")
+            .arg("pyproject.toml")
+            .arg("--extra")
+            .arg("test"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 4 packages in [TIME]
+    Downloaded 4 packages in [TIME]
+    Installed 4 packages in [TIME]
+     + anyio==3.7.1
+     + idna==3.6
+     + iniconfig==2.0.0
+     + sniffio==1.3.1
+    "###
+    );
+
+    Ok(())
+}
+
 /// Respect installed versions when resolving.
 #[test]
 fn respect_installed_and_reinstall() -> Result<()> {
@@ -399,10 +413,9 @@ fn respect_installed_and_reinstall() -> Result<()> {
 
     // Install Flask.
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("Flask==2.3.2")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -428,10 +441,9 @@ fn respect_installed_and_reinstall() -> Result<()> {
 
     // Re-install Flask. We should respect the existing version.
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("Flask")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -448,7 +460,6 @@ fn respect_installed_and_reinstall() -> Result<()> {
 
     // Install a newer version of Flask. We should upgrade it.
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("Flask==2.3.3")?;
 
     let filters = if cfg!(windows) {
@@ -461,7 +472,7 @@ fn respect_installed_and_reinstall() -> Result<()> {
     } else {
         context.filters()
     };
-    uv_snapshot!(filters, command(&context)
+    uv_snapshot!(filters, context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -480,10 +491,9 @@ fn respect_installed_and_reinstall() -> Result<()> {
 
     // Re-install Flask. We should upgrade it.
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("Flask")?;
 
-    uv_snapshot!(filters, command(&context)
+    uv_snapshot!(filters, context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--reinstall-package")
@@ -504,10 +514,9 @@ fn respect_installed_and_reinstall() -> Result<()> {
 
     // Re-install Flask. We should install even though the version is current
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("Flask")?;
 
-    uv_snapshot!(filters, command(&context)
+    uv_snapshot!(filters, context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--reinstall-package")
@@ -537,7 +546,7 @@ fn reinstall_extras() -> Result<()> {
     let requirements_txt = context.temp_dir.child("requirements.txt");
     requirements_txt.write_str("httpx")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -563,10 +572,9 @@ fn reinstall_extras() -> Result<()> {
 
     // Re-install httpx, with an extra.
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("httpx[http2]")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -596,10 +604,9 @@ fn reinstall_incomplete() -> Result<()> {
 
     // Install anyio.
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("anyio==3.7.0")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt"), @r###"
     success: true
@@ -621,10 +628,9 @@ fn reinstall_incomplete() -> Result<()> {
 
     // Re-install anyio.
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("anyio==4.0.0")?;
 
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("-r")
         .arg("requirements.txt"), @r###"
     success: true
@@ -651,10 +657,9 @@ fn allow_incompatibilities() -> Result<()> {
 
     // Install Flask, which relies on `Werkzeug>=3.0.0`.
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("Flask")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -680,10 +685,9 @@ fn allow_incompatibilities() -> Result<()> {
 
     // Install an incompatible version of Jinja2.
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("jinja2==2.11.3")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -712,7 +716,7 @@ fn install_editable() {
     let context = TestContext::new("3.12");
 
     // Install the editable package.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("-e")
         .arg(context.workspace_root.join("scripts/packages/poetry_editable")), @r###"
     success: true
@@ -732,7 +736,7 @@ fn install_editable() {
     );
 
     // Install it again (no-op).
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("-e")
         .arg(context.workspace_root.join("scripts/packages/poetry_editable")), @r###"
     success: true
@@ -745,7 +749,7 @@ fn install_editable() {
     );
 
     // Add another, non-editable dependency.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("-e")
         .arg(context.workspace_root.join("scripts/packages/poetry_editable"))
         .arg("black"), @r###"
@@ -775,7 +779,7 @@ fn install_editable_and_registry() {
     let context = TestContext::new("3.12");
 
     // Install the registry-based version of Black.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("black"), @r###"
     success: true
     exit_code: 0
@@ -795,7 +799,7 @@ fn install_editable_and_registry() {
     );
 
     // Install the editable version of Black. This should remove the registry-based version.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("-e")
         .arg(context.workspace_root.join("scripts/packages/black_editable")), @r###"
     success: true
@@ -813,7 +817,7 @@ fn install_editable_and_registry() {
 
     // Re-install the registry-based version of Black. This should be a no-op, since we have a
     // version of Black installed (the editable version) that satisfies the requirements.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("black")
         .arg("--strict"), @r###"
     success: true
@@ -835,7 +839,7 @@ fn install_editable_and_registry() {
         .collect();
 
     // Re-install Black at a specific version. This should replace the editable version.
-    uv_snapshot!(filters, command(&context)
+    uv_snapshot!(filters, context.install()
         .arg("black==23.10.0"), @r###"
     success: true
     exit_code: 0
@@ -856,7 +860,7 @@ fn install_editable_no_binary() {
     let context = TestContext::new("3.12");
 
     // Install the editable package with no-binary enabled
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("-e")
         .arg(context.workspace_root.join("scripts/packages/black_editable"))
         .arg("--no-binary")
@@ -888,7 +892,7 @@ fn reinstall_build_system() -> Result<()> {
         "
     })?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("--reinstall")
         .arg("-r")
         .arg("requirements.txt")
@@ -920,7 +924,7 @@ fn reinstall_build_system() -> Result<()> {
 fn install_no_index() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("Flask")
         .arg("--no-index"), @r###"
     success: false
@@ -929,12 +933,9 @@ fn install_no_index() {
 
     ----- stderr -----
       × No solution found when resolving dependencies:
-      ╰─▶ Because flask was not found in the provided package locations and you
-          require flask, we can conclude that the requirements are unsatisfiable.
+      ╰─▶ Because flask was not found in the provided package locations and you require flask, we can conclude that the requirements are unsatisfiable.
 
-          hint: Packages were unavailable because index lookups were disabled
-          and no additional package locations were provided (try: `--find-links
-          <uri>`)
+          hint: Packages were unavailable because index lookups were disabled and no additional package locations were provided (try: `--find-links <uri>`)
     "###
     );
 
@@ -947,7 +948,7 @@ fn install_no_index() {
 fn install_no_index_version() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("Flask==3.0.0")
         .arg("--no-index"), @r###"
     success: false
@@ -956,13 +957,9 @@ fn install_no_index_version() {
 
     ----- stderr -----
       × No solution found when resolving dependencies:
-      ╰─▶ Because flask==3.0.0 was not found in the provided package locations
-          and you require flask==3.0.0, we can conclude that the requirements
-          are unsatisfiable.
+      ╰─▶ Because flask==3.0.0 was not found in the provided package locations and you require flask==3.0.0, we can conclude that the requirements are unsatisfiable.
 
-          hint: Packages were unavailable because index lookups were disabled
-          and no additional package locations were provided (try: `--find-links
-          <uri>`)
+          hint: Packages were unavailable because index lookups were disabled and no additional package locations were provided (try: `--find-links <uri>`)
     "###
     );
 
@@ -986,7 +983,7 @@ fn install_no_index_version() {
 fn install_extra_index_url_has_priority() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command_without_exclude_newer(&context)
+    uv_snapshot!(context.install_without_exclude_newer()
         .arg("--index-url")
         .arg("https://test.pypi.org/simple")
         .arg("--extra-index-url")
@@ -1023,11 +1020,11 @@ fn install_extra_index_url_has_priority() {
 fn install_git_public_https() {
     let context = TestContext::new("3.8");
 
-    let mut command = command(&context);
-    command.arg("uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage");
-
-    uv_snapshot!(command
-        , @r###"
+    uv_snapshot!(
+        context
+        .install()
+        .arg("uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage"),
+        @r###"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1053,7 +1050,7 @@ fn install_git_public_https_missing_branch_or_tag() {
     filters.push(("`git fetch .*`", "`git fetch [...]`"));
     filters.push(("exit status", "exit code"));
 
-    uv_snapshot!(filters, command(&context)
+    uv_snapshot!(filters, context.install()
         // 2.0.0 does not exist
         .arg("uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage@2.0.0"), @r###"
     success: false
@@ -1083,7 +1080,13 @@ fn install_git_public_https_missing_commit() {
     filters.push(("`git fetch .*`", "`git fetch [...]`"));
     filters.push(("exit status", "exit code"));
 
-    uv_snapshot!(filters, command(&context)
+    // There are flakes on Windows where this irrelevant error is appended
+    filters.push((
+        "fatal: unable to write response end packet: Broken pipe\n",
+        "",
+    ));
+
+    uv_snapshot!(filters, context.install()
         // 2.0.0 does not exist
         .arg("uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage@79a935a7a1a0ad6d0bdf72dce0e16cb0a24a1b3b")
         , @r###"
@@ -1119,7 +1122,7 @@ fn install_git_private_https_pat() {
         "uv-private-pypackage @ git+https://{token}@github.com/astral-test/uv-private-pypackage"
     );
 
-    uv_snapshot!(filters, command(&context).arg(package)
+    uv_snapshot!(filters, context.install().arg(package)
         , @r###"
     success: true
     exit_code: 0
@@ -1158,7 +1161,7 @@ fn install_git_private_https_pat_at_ref() {
     };
 
     let package = format!("uv-private-pypackage @ git+https://{user}{token}@github.com/astral-test/uv-private-pypackage@6c09ce9ae81f50670a60abd7d95f30dd416d00ac");
-    uv_snapshot!(filters, command(&context)
+    uv_snapshot!(filters, context.install()
         .arg(package), @r###"
     success: true
     exit_code: 0
@@ -1192,7 +1195,7 @@ fn install_git_private_https_pat_and_username() {
         .chain(context.filters())
         .collect();
 
-    uv_snapshot!(filters, command(&context).arg(format!("uv-private-pypackage @ git+https://{user}:{token}@github.com/astral-test/uv-private-pypackage"))
+    uv_snapshot!(filters, context.install().arg(format!("uv-private-pypackage @ git+https://{user}:{token}@github.com/astral-test/uv-private-pypackage"))
         , @r###"
     success: true
     exit_code: 0
@@ -1222,7 +1225,7 @@ fn install_git_private_https_pat_not_authorized() {
 
     // We provide a username otherwise (since the token is invalid), the git cli will prompt for a password
     // and hang the test
-    uv_snapshot!(filters, command(&context)
+    uv_snapshot!(filters, context.install()
         .arg(format!("uv-private-pypackage @ git+https://git:{token}@github.com/astral-test/uv-private-pypackage"))
         , @r###"
     success: false
@@ -1232,7 +1235,7 @@ fn install_git_private_https_pat_not_authorized() {
     ----- stderr -----
     error: Failed to download and build: uv-private-pypackage @ git+https://git:***@github.com/astral-test/uv-private-pypackage
       Caused by: Git operation failed
-      Caused by: failed to clone into: [CACHE_DIR]/git-v0/db/2496970ed6fdf08f
+      Caused by: failed to clone into: [CACHE_DIR]/git-v0/db/8401f5508e3e612d
       Caused by: process didn't exit successfully: `git fetch --force --update-head-ok 'https://git:***@github.com/astral-test/uv-private-pypackage' '+HEAD:refs/remotes/origin/HEAD'` (exit status: 128)
     --- stderr
     remote: Support for password authentication was removed on August 13, 2021.
@@ -1248,9 +1251,11 @@ fn reinstall_no_binary() {
     let context = TestContext::new("3.12");
 
     // The first installation should use a pre-built wheel
-    let mut command = command(&context);
+    let mut command = context.install();
     command.arg("anyio").arg("--strict");
-    uv_snapshot!(command, @r###"
+    uv_snapshot!(
+        command,
+        @r###"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -1269,7 +1274,7 @@ fn reinstall_no_binary() {
 
     // Running installation again with `--no-binary` should be a no-op
     // The first installation should use a pre-built wheel
-    let mut command = crate::command(&context);
+    let mut command = context.install();
     command
         .arg("anyio")
         .arg("--no-binary")
@@ -1299,7 +1304,7 @@ fn reinstall_no_binary() {
         context.filters()
     };
 
-    let mut command = crate::command(&context);
+    let mut command = context.install();
     command
         .arg("anyio")
         .arg("--no-binary")
@@ -1337,7 +1342,7 @@ fn only_binary_requirements_txt() {
         })
         .unwrap();
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -1347,10 +1352,7 @@ fn only_binary_requirements_txt() {
 
     ----- stderr -----
       × No solution found when resolving dependencies:
-      ╰─▶ Because django-allauth==0.51.0 is unusable because no wheels
-          are usable and building from source is disabled and you require
-          django-allauth==0.51.0, we can conclude that the requirements are
-          unsatisfiable.
+      ╰─▶ Because django-allauth==0.51.0 is unusable because no wheels are usable and building from source is disabled and you require django-allauth==0.51.0, we can conclude that the requirements are unsatisfiable.
     "###
     );
 }
@@ -1363,7 +1365,7 @@ fn only_binary_requirements_txt() {
 fn install_executable() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("pylint==3.0.0"), @r###"
     success: true
     exit_code: 0
@@ -1397,7 +1399,7 @@ fn install_executable() {
 fn install_executable_copy() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("pylint==3.0.0")
         .arg("--link-mode")
         .arg("copy"), @r###"
@@ -1433,7 +1435,7 @@ fn install_executable_copy() {
 fn install_executable_hardlink() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("pylint==3.0.0")
         .arg("--link-mode")
         .arg("hardlink"), @r###"
@@ -1469,7 +1471,7 @@ fn no_deps() {
     let context = TestContext::new("3.12");
 
     // Install Flask.
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("Flask")
         .arg("--no-deps")
         .arg("--strict"), @r###"
@@ -1499,7 +1501,7 @@ fn install_upgrade() {
     let context = TestContext::new("3.12");
 
     // Install an old version of anyio and httpcore.
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("anyio==3.6.2")
         .arg("httpcore==0.16.3")
         .arg("--strict"), @r###"
@@ -1523,7 +1525,7 @@ fn install_upgrade() {
     context.assert_command("import anyio").success();
 
     // Upgrade anyio.
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("anyio")
         .arg("--upgrade-package")
         .arg("anyio"), @r###"
@@ -1541,7 +1543,7 @@ fn install_upgrade() {
     );
 
     // Upgrade anyio again, should not reinstall.
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("anyio")
         .arg("--upgrade-package")
         .arg("anyio"), @r###"
@@ -1556,7 +1558,7 @@ fn install_upgrade() {
     );
 
     // Install httpcore, request anyio upgrade should not reinstall
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("httpcore")
         .arg("--upgrade-package")
         .arg("anyio"), @r###"
@@ -1571,7 +1573,7 @@ fn install_upgrade() {
     );
 
     // Upgrade httpcore with global flag
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("httpcore")
         .arg("--upgrade"), @r###"
     success: true
@@ -1598,7 +1600,7 @@ fn install_constraints_txt() -> Result<()> {
     let constraints_txt = context.temp_dir.child("constraints.txt");
     constraints_txt.write_str("idna<3.4")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
             .arg("-r")
             .arg("requirements.txt")
             .arg("--constraint")
@@ -1630,7 +1632,7 @@ fn install_constraints_inline() -> Result<()> {
     let constraints_txt = context.temp_dir.child("constraints.txt");
     constraints_txt.write_str("idna<3.4")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
             .arg("-r")
             .arg("requirements.txt"), @r###"
     success: true
@@ -1655,7 +1657,7 @@ fn install_constraints_inline() -> Result<()> {
 fn install_constraints_remote() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
             .arg("-c")
             .arg("https://raw.githubusercontent.com/apache/airflow/constraints-2-6/constraints-3.11.txt")
             .arg("typing_extensions>=4.0"), @r###"
@@ -1680,7 +1682,7 @@ fn install_constraints_inline_remote() -> Result<()> {
     let requirementstxt = context.temp_dir.child("requirements.txt");
     requirementstxt.write_str("typing-extensions>=4.0\n-c https://raw.githubusercontent.com/apache/airflow/constraints-2-6/constraints-3.11.txt")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
             .arg("-r")
             .arg("requirements.txt"), @r###"
     success: true
@@ -1702,7 +1704,7 @@ fn install_constraints_inline_remote() -> Result<()> {
 fn install_constraints_respects_offline_mode() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
             .arg("--offline")
             .arg("-r")
             .arg("http://example.com/requirements.txt"), @r###"
@@ -1730,7 +1732,7 @@ fn install_pinned_polars_invalid_metadata() {
     let context = TestContext::new("3.12");
 
     // Install Flask.
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("polars==0.14.0"),
         @r###"
     success: true
@@ -1756,7 +1758,7 @@ fn install_sdist_resolution_lowest() -> Result<()> {
     let requirements_in = context.temp_dir.child("requirements.in");
     requirements_in.write_str("anyio @ https://files.pythonhosted.org/packages/2d/b8/7333d87d5f03247215d86a86362fd3e324111788c6cdd8d2e6196a6ba833/anyio-4.2.0.tar.gz")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
             .arg("-r")
             .arg("requirements.in")
             .arg("--resolution=lowest-direct"), @r###"
@@ -1789,7 +1791,7 @@ fn direct_url_zip_file_bunk_permissions() -> Result<()> {
         "opensafely-pipeline @ https://github.com/opensafely-core/pipeline/archive/refs/tags/v2023.11.06.145820.zip",
     )?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -1828,8 +1830,8 @@ fn launcher() -> Result<()> {
 
     uv_snapshot!(
         filters,
-        command(&context)
-        .arg(format!("simple_launcher@{}", project_root.join("scripts/wheels/simple_launcher-0.1.0-py3-none-any.whl").display()))
+        context.install()
+        .arg(format!("simple_launcher@{}", project_root.join("scripts/links/simple_launcher-0.1.0-py3-none-any.whl").display()))
         .arg("--strict"), @r###"
     success: true
     exit_code: 0
@@ -1873,8 +1875,8 @@ fn launcher_with_symlink() -> Result<()> {
     ];
 
     uv_snapshot!(filters,
-        command(&context)
-            .arg(format!("simple_launcher@{}", project_root.join("scripts/wheels/simple_launcher-0.1.0-py3-none-any.whl").display()))
+        context.install()
+            .arg(format!("simple_launcher@{}", project_root.join("scripts/links/simple_launcher-0.1.0-py3-none-any.whl").display()))
             .arg("--strict"),
         @r###"
     success: true
@@ -1931,7 +1933,7 @@ fn config_settings() {
     let context = TestContext::new("3.12");
 
     // Install the editable package.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("-e")
         .arg(context.workspace_root.join("scripts/packages/setuptools_editable")), @r###"
     success: true
@@ -1957,7 +1959,7 @@ fn config_settings() {
     // Install the editable package with `--editable_mode=compat`.
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("-e")
         .arg(context.workspace_root.join("scripts/packages/setuptools_editable"))
         .arg("-C")
@@ -2028,7 +2030,7 @@ fn reinstall_duplicate() -> Result<()> {
     )?;
 
     // Run `pip install`.
-    uv_snapshot!(command(&context1)
+    uv_snapshot!(context1.install()
         .arg("pip")
         .arg("--reinstall"),
         @r###"
@@ -2054,7 +2056,7 @@ fn reinstall_duplicate() -> Result<()> {
 fn install_symlink() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("pgpdump==1.5")
         .arg("--strict"), @r###"
     success: true
@@ -2103,7 +2105,7 @@ requires-python = ">=3.8"
 "#,
     )?;
 
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("--editable")
         .arg(editable_dir.path()), @r###"
     success: true
@@ -2123,7 +2125,7 @@ requires-python = ">=3.8"
     );
 
     // Re-installing should be a no-op.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("--editable")
         .arg(editable_dir.path()), @r###"
     success: true
@@ -2148,7 +2150,7 @@ requires-python = ">=3.8"
     )?;
 
     // Re-installing should update the package.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("--editable")
         .arg(editable_dir.path()), @r###"
     success: true
@@ -2194,7 +2196,7 @@ dependencies = {file = ["requirements.txt"]}
     let requirements_txt = editable_dir.child("requirements.txt");
     requirements_txt.write_str("anyio==4.0.0")?;
 
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("--editable")
         .arg(editable_dir.path()), @r###"
     success: true
@@ -2214,7 +2216,7 @@ dependencies = {file = ["requirements.txt"]}
     );
 
     // Re-installing should re-install.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("--editable")
         .arg(editable_dir.path()), @r###"
     success: true
@@ -2234,7 +2236,7 @@ dependencies = {file = ["requirements.txt"]}
     requirements_txt.write_str("anyio==3.7.1")?;
 
     // Re-installing should update the package.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("--editable")
         .arg(editable_dir.path()), @r###"
     success: true
@@ -2275,7 +2277,7 @@ requires-python = ">=3.8"
 "#,
     )?;
 
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("example @ .")
         .current_dir(editable_dir.path()), @r###"
     success: true
@@ -2294,7 +2296,7 @@ requires-python = ">=3.8"
     );
 
     // Re-installing should be a no-op.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("example @ .")
         .current_dir(editable_dir.path()), @r###"
     success: true
@@ -2319,7 +2321,7 @@ requires-python = ">=3.8"
     )?;
 
     // Re-installing should update the package.
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("example @ .")
         .current_dir(editable_dir.path()), @r###"
     success: true
@@ -2361,7 +2363,7 @@ requires-python = ">=3.11,<3.13"
 "#,
     )?;
 
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("--editable")
         .arg(editable_dir.path()), @r###"
     success: true
@@ -2403,7 +2405,7 @@ requires-python = "<=3.8"
 "#,
     )?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg("--editable")
         .arg(editable_dir.path()), @r###"
     success: false
@@ -2411,7 +2413,7 @@ requires-python = "<=3.8"
     ----- stdout -----
 
     ----- stderr -----
-    error: Editable `example` requires Python <=3.8, but 3.12.1 is installed
+    error: Editable `example` requires Python <=3.8, but 3.12.[X] is installed
     "###
     );
 
@@ -2429,7 +2431,7 @@ fn no_build_isolation() -> Result<()> {
     let filters = std::iter::once((r"exit code: 1", "exit status: 1"))
         .chain(context.filters())
         .collect::<Vec<_>>();
-    uv_snapshot!(filters, command(&context)
+    uv_snapshot!(filters, context.install()
         .arg("-r")
         .arg("requirements.in")
         .arg("--no-build-isolation"), @r###"
@@ -2452,7 +2454,7 @@ fn no_build_isolation() -> Result<()> {
     );
 
     // Install `setuptools` and `wheel`.
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("setuptools")
         .arg("wheel"), @r###"
     success: true
@@ -2468,7 +2470,7 @@ fn no_build_isolation() -> Result<()> {
     "###);
 
     // We expect the build to succeed, since `setuptools` is now installed.
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.in")
         .arg("--no-build-isolation"), @r###"
@@ -2496,10 +2498,9 @@ fn no_build_isolation() -> Result<()> {
 fn install_utf16le_requirements() -> Result<()> {
     let context = TestContext::new("3.12");
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_binary(&utf8_to_utf16_with_bom_le("tomli"))?;
 
-    uv_snapshot!(command_without_exclude_newer(&context)
+    uv_snapshot!(context.install_without_exclude_newer()
         .arg("-r")
         .arg("requirements.txt"), @r###"
     success: true
@@ -2523,10 +2524,9 @@ fn install_utf16le_requirements() -> Result<()> {
 fn install_utf16be_requirements() -> Result<()> {
     let context = TestContext::new("3.12");
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_binary(&utf8_to_utf16_with_bom_be("tomli"))?;
 
-    uv_snapshot!(command_without_exclude_newer(&context)
+    uv_snapshot!(context.install_without_exclude_newer()
         .arg("-r")
         .arg("requirements.txt"), @r###"
     success: true
@@ -2567,10 +2567,9 @@ fn utf8_to_utf16_with_bom_be(s: &str) -> Vec<u8> {
 fn dry_run_install() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let context = TestContext::new("3.12");
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("httpx==0.25.1")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--dry-run")
@@ -2600,10 +2599,9 @@ fn dry_run_install() -> std::result::Result<(), Box<dyn std::error::Error>> {
 fn dry_run_install_url_dependency() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let context = TestContext::new("3.12");
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("anyio @ https://files.pythonhosted.org/packages/2d/b8/7333d87d5f03247215d86a86362fd3e324111788c6cdd8d2e6196a6ba833/anyio-4.2.0.tar.gz")?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--dry-run")
@@ -2629,11 +2627,10 @@ fn dry_run_install_url_dependency() -> std::result::Result<(), Box<dyn std::erro
 fn dry_run_uninstall_url_dependency() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let context = TestContext::new("3.12");
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("anyio @ https://files.pythonhosted.org/packages/2d/b8/7333d87d5f03247215d86a86362fd3e324111788c6cdd8d2e6196a6ba833/anyio-4.2.0.tar.gz")?;
 
     // Install the URL dependency
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -2653,7 +2650,7 @@ fn dry_run_uninstall_url_dependency() -> std::result::Result<(), Box<dyn std::er
 
     // Then switch to a registry dependency
     requirements_txt.write_str("anyio")?;
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--upgrade-package")
@@ -2681,11 +2678,10 @@ fn dry_run_uninstall_url_dependency() -> std::result::Result<(), Box<dyn std::er
 fn dry_run_install_already_installed() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let context = TestContext::new("3.12");
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("httpx==0.25.1")?;
 
     // Install the package
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -2708,7 +2704,7 @@ fn dry_run_install_already_installed() -> std::result::Result<(), Box<dyn std::e
     );
 
     // Install again with dry run enabled
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--dry-run")
@@ -2732,11 +2728,10 @@ fn dry_run_install_transitive_dependency_already_installed(
     let context = TestContext::new("3.12");
 
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("httpcore==1.0.2")?;
 
     // Install a dependency of httpx
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -2756,7 +2751,7 @@ fn dry_run_install_transitive_dependency_already_installed(
 
     // Install it httpx with dry run enabled
     requirements_txt.write_str("httpx==0.25.1")?;
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--dry-run")
@@ -2783,11 +2778,10 @@ fn dry_run_install_transitive_dependency_already_installed(
 fn dry_run_install_then_upgrade() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let context = TestContext::new("3.12");
     let requirements_txt = context.temp_dir.child("requirements.txt");
-    requirements_txt.touch()?;
     requirements_txt.write_str("httpx==0.25.0")?;
 
     // Install the package
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--strict"), @r###"
@@ -2811,7 +2805,7 @@ fn dry_run_install_then_upgrade() -> std::result::Result<(), Box<dyn std::error:
 
     // Bump the version and install with dry run enabled
     requirements_txt.write_str("httpx==0.25.1")?;
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("-r")
         .arg("requirements.txt")
         .arg("--dry-run"), @r###"
@@ -2852,7 +2846,7 @@ requires-python = "<=3.8"
 "#,
     )?;
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg(format!("example @ {}", editable_dir.path().display())), @r###"
     success: false
     exit_code: 1
@@ -2860,11 +2854,8 @@ requires-python = "<=3.8"
 
     ----- stderr -----
       × No solution found when resolving dependencies:
-      ╰─▶ Because the current Python version (3.12.1) does not satisfy Python<=3.8
-          and example==0.0.0 depends on Python<=3.8, we can conclude that
-          example==0.0.0 cannot be used.
-          And because only example==0.0.0 is available and you require example, we
-          can conclude that the requirements are unsatisfiable.
+      ╰─▶ Because the current Python version (3.12.[X]) does not satisfy Python<=3.8 and example==0.0.0 depends on Python<=3.8, we can conclude that example==0.0.0 cannot be used.
+          And because only example==0.0.0 is available and you require example, we can conclude that the requirements are unsatisfiable.
     "###
     );
 
@@ -2876,7 +2867,7 @@ requires-python = "<=3.8"
 fn install_package_basic_auth_from_url() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("anyio")
         .arg("--index-url")
         .arg("https://public:heron@pypi-proxy.fly.dev/basic-auth/simple")
@@ -2903,7 +2894,7 @@ fn install_package_basic_auth_from_url() {
 fn install_index_with_relative_links() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("anyio")
         .arg("--index-url")
         .arg("https://pypi-proxy.fly.dev/relative/simple")
@@ -2930,7 +2921,7 @@ fn install_index_with_relative_links() {
 fn install_index_with_relative_links_authenticated() {
     let context = TestContext::new("3.12");
 
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("anyio")
         .arg("--index-url")
         .arg("https://public:heron@pypi-proxy.fly.dev/basic-auth/relative/simple")
@@ -2968,7 +2959,7 @@ fn install_site_packages_mtime_updated() -> Result<()> {
     let pre_mtime_ns = metadata.mtime_nsec();
 
     // Install a package.
-    uv_snapshot!(command(&context)
+    uv_snapshot!(context.install()
         .arg("anyio")
         .arg("--strict"), @r###"
     success: true
@@ -3008,7 +2999,7 @@ fn deptry_gitignore() {
         .workspace_root
         .join("scripts/packages/deptry_reproducer");
 
-    uv_snapshot!(context.filters(), command(&context)
+    uv_snapshot!(context.filters(), context.install()
         .arg(format!("deptry_reproducer @ {}", source_dist_dir.join("deptry_reproducer-0.1.0.tar.gz").simplified_display()))
         .arg("--strict")
         .current_dir(source_dist_dir), @r###"
@@ -3030,4 +3021,1080 @@ fn deptry_gitignore() {
     context
         .assert_command("import deptry_reproducer.foo")
         .success();
+}
+
+/// Reinstall an installed package with `--no-index`
+#[test]
+fn reinstall_no_index() {
+    let context = TestContext::new("3.12");
+
+    // Install anyio
+    uv_snapshot!(context.install()
+        .arg("anyio")
+        .arg("--strict"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    Downloaded 3 packages in [TIME]
+    Installed 3 packages in [TIME]
+     + anyio==4.3.0
+     + idna==3.6
+     + sniffio==1.3.1
+    "###
+    );
+
+    // Install anyio again
+    uv_snapshot!(context.install()
+        .arg("anyio")
+        .arg("--no-index")
+        .arg("--strict"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Audited 1 package in [TIME]
+    "###
+    );
+
+    // Reinstall
+    // We should not consider the already installed package as a source and
+    // should attempt to pull from the index
+    uv_snapshot!(context.install()
+        .arg("anyio")
+        .arg("--no-index")
+        .arg("--reinstall")
+        .arg("--strict"), @r###"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+      × No solution found when resolving dependencies:
+      ╰─▶ Because anyio was not found in the provided package locations and you require anyio, we can conclude that the requirements are unsatisfiable.
+
+          hint: Packages were unavailable because index lookups were disabled and no additional package locations were provided (try: `--find-links <uri>`)
+    "###
+    );
+}
+
+#[test]
+fn already_installed_remote_dependencies() {
+    let context = TestContext::new("3.12");
+
+    // Install anyio's dependencies.
+    uv_snapshot!(context.install()
+        .arg("idna")
+        .arg("sniffio")
+        .arg("--strict"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Downloaded 2 packages in [TIME]
+    Installed 2 packages in [TIME]
+     + idna==3.6
+     + sniffio==1.3.1
+    "###
+    );
+
+    // Install anyio.
+    uv_snapshot!(context.install()
+        .arg("anyio")
+        .arg("--strict"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + anyio==4.3.0
+    "###
+    );
+}
+
+/// Install an editable package that depends on a previously installed editable package.
+#[test]
+fn already_installed_dependent_editable() {
+    let context = TestContext::new("3.12");
+    let root_path = context
+        .workspace_root
+        .join("scripts/packages/dependent_editables");
+
+    // Install the first editable
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("first_editable")), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + first-editable==0.0.1 (from file://[WORKSPACE]/scripts/packages/dependent_editables/first_editable)
+    "###
+    );
+
+    // Install the second editable which depends on the first editable
+    // The already installed first editable package should satisfy the requirement
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("second_editable"))
+        // Disable the index to guard this test against dependency confusion attacks
+        .arg("--no-index")
+        .arg("--find-links")
+        .arg(BUILD_VENDOR_LINKS_URL), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + second-editable==0.0.1 (from file://[WORKSPACE]/scripts/packages/dependent_editables/second_editable)
+    "###
+    );
+
+    // Request install of the first editable by full path again
+    // We should audit the installed package
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("first_editable")), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Audited 1 package in [TIME]
+    "###
+    );
+
+    // Request reinstallation of the first package during install of the second
+    // It's not available on an index and the user has not specified the path so we fail
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("second_editable"))
+        .arg("--reinstall-package")
+        .arg("first-editable")
+        // Disable the index to guard this test against dependency confusion attacks
+        .arg("--no-index")
+        .arg("--find-links")
+        .arg(BUILD_VENDOR_LINKS_URL), @r###"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+      × No solution found when resolving dependencies:
+      ╰─▶ Because first-editable was not found in the provided package locations and second-editable==0.0.1 depends on first-editable, we can conclude that second-editable==0.0.1 cannot be used.
+          And because only second-editable==0.0.1 is available and you require second-editable, we can conclude that the requirements are unsatisfiable.
+    "###
+    );
+
+    // Request reinstallation of the first package
+    // We include it in the install command with a full path so we should succeed
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("first_editable"))
+        .arg("--reinstall-package")
+        .arg("first-editable"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Installed 1 package in [TIME]
+     - first-editable==0.0.1 (from file://[WORKSPACE]/scripts/packages/dependent_editables/first_editable)
+     + first-editable==0.0.1 (from file://[WORKSPACE]/scripts/packages/dependent_editables/first_editable)
+    "###
+    );
+}
+
+/// Install an local package that depends on a previously installed local package.
+#[test]
+fn already_installed_local_path_dependent() {
+    let context = TestContext::new("3.12");
+    let root_path = context
+        .workspace_root
+        .join("scripts/packages/dependent_locals");
+
+    // Install the first local
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("first_local")), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + first-local==0.1.0 (from file://[WORKSPACE]/scripts/packages/dependent_locals/first_local)
+    "###
+    );
+
+    // Install the second local which depends on the first local
+    // The already installed first local package should satisfy the requirement
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("second_local"))
+        // Disable the index to guard this test against dependency confusion attacks
+        .arg("--no-index")
+        .arg("--find-links")
+        .arg(BUILD_VENDOR_LINKS_URL), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + second-local==0.1.0 (from file://[WORKSPACE]/scripts/packages/dependent_locals/second_local)
+    "###
+    );
+
+    // Request install of the first local by full path again
+    // We should audit the installed package
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("first_local")), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Audited 1 package in [TIME]
+    "###
+    );
+
+    // Request reinstallation of the first package during install of the second
+    // It's not available on an index and the user has not specified the path so we fail
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("second_local"))
+        .arg("--reinstall-package")
+        .arg("first-local")
+        // Disable the index to guard this test against dependency confusion attacks
+        .arg("--no-index")
+        .arg("--find-links")
+        .arg(BUILD_VENDOR_LINKS_URL), @r###"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+      × No solution found when resolving dependencies:
+      ╰─▶ Because first-local was not found in the provided package locations and second-local==0.1.0 depends on first-local, we can conclude that second-local==0.1.0 cannot be used.
+          And because only second-local==0.1.0 is available and you require second-local, we can conclude that the requirements are unsatisfiable.
+    "###
+    );
+
+    // Request reinstallation of the first package
+    // We include it in the install command with a full path so we succeed
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("second_local"))
+        .arg(root_path.join("first_local"))
+        .arg("--reinstall-package")
+        .arg("first-local"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Installed 1 package in [TIME]
+     - first-local==0.1.0 (from file://[WORKSPACE]/scripts/packages/dependent_locals/first_local)
+     + first-local==0.1.0 (from file://[WORKSPACE]/scripts/packages/dependent_locals/first_local)
+    "###
+    );
+
+    // Request upgrade of the first package
+    // It's not available on an index and the user has not specified the path so we fail
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("second_local"))
+        .arg("--upgrade-package")
+        .arg("first-local")
+        // Disable the index to guard this test against dependency confusion attacks
+        .arg("--no-index")
+        .arg("--find-links")
+        .arg(BUILD_VENDOR_LINKS_URL), @r###"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+      × No solution found when resolving dependencies:
+      ╰─▶ Because first-local was not found in the provided package locations and second-local==0.1.0 depends on first-local, we can conclude that second-local==0.1.0 cannot be used.
+          And because only second-local==0.1.0 is available and you require second-local, we can conclude that the requirements are unsatisfiable.
+    "###
+    );
+
+    // Request upgrade of the first package
+    // A full path is specified and there's nothing to upgrade to so we should just audit
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("first_local"))
+        .arg(root_path.join("second_local"))
+        .arg("--upgrade-package")
+        .arg("first-local")
+        // Disable the index to guard this test against dependency confusion attacks
+        .arg("--no-index")
+        .arg("--find-links")
+        .arg(BUILD_VENDOR_LINKS_URL), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    Audited 2 packages in [TIME]
+    "###
+    );
+}
+
+/// A local version of a package shadowing a remote package is installed.
+#[test]
+fn already_installed_local_version_of_remote_package() {
+    let context = TestContext::new("3.12");
+    let root_path = context.workspace_root.join("scripts/packages");
+
+    // Install the local anyio first
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("anyio_local")), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + anyio==4.3.0+foo (from file://[WORKSPACE]/scripts/packages/anyio_local)
+    "###
+    );
+
+    // Install again without specifying a local path — this should not pull from the index
+    uv_snapshot!(context.filters(), context.install()
+        .arg("anyio"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Audited 1 package in [TIME]
+    "###
+    );
+
+    // Request install with a different version
+    // We should attempt to pull from the index since the installed version does not match
+    // but we disable it here to preserve this dependency for future tests
+    uv_snapshot!(context.filters(), context.install()
+        .arg("anyio==4.2.0")
+        .arg("--no-index"), @r###"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+      × No solution found when resolving dependencies:
+      ╰─▶ Because anyio==4.2.0 was not found in the provided package locations and you require anyio==4.2.0, we can conclude that the requirements are unsatisfiable.
+
+          hint: Packages were unavailable because index lookups were disabled and no additional package locations were provided (try: `--find-links <uri>`)
+    "###
+    );
+
+    // Request reinstallation with the local version segment — this should fail since it is not available
+    // in the index and the path was not provided
+    uv_snapshot!(context.filters(), context.install()
+        .arg("anyio==4.3.0+foo")
+        .arg("--reinstall"), @r###"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+      × No solution found when resolving dependencies:
+      ╰─▶ Because there is no version of anyio==4.3.0+foo and you require anyio==4.3.0+foo, we can conclude that the requirements are unsatisfiable.
+    "###
+    );
+
+    // Request reinstall with the full path, this should reinstall from the path
+    // and not pull from the index
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("anyio_local"))
+        .arg("--reinstall")
+        .arg("anyio"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Installed 1 package in [TIME]
+     - anyio==4.3.0+foo (from file://[WORKSPACE]/scripts/packages/anyio_local)
+     + anyio==4.3.0+foo (from file://[WORKSPACE]/scripts/packages/anyio_local)
+    "###
+    );
+
+    // Request reinstallation with just the name, this should pull from the index
+    // and replace the path dependency
+    uv_snapshot!(context.filters(), context.install()
+        .arg("anyio")
+        .arg("--reinstall"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    Downloaded 3 packages in [TIME]
+    Installed 3 packages in [TIME]
+     - anyio==4.3.0+foo (from file://[WORKSPACE]/scripts/packages/anyio_local)
+     + anyio==4.3.0
+     + idna==3.6
+     + sniffio==1.3.1
+    "###
+    );
+
+    // Install the local anyio again so we can test upgrades
+    uv_snapshot!(context.filters(), context.install()
+        .arg(root_path.join("anyio_local")), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Installed 1 package in [TIME]
+     - anyio==4.3.0
+     + anyio==4.3.0+foo (from file://[WORKSPACE]/scripts/packages/anyio_local)
+    "###
+    );
+
+    // Request upgrade with just the name
+    // We shouldn't pull from the index because the local version is "newer"
+    uv_snapshot!(context.filters(), context.install()
+        .arg("anyio")
+        .arg("--upgrade"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    Audited 3 packages in [TIME]
+    "###
+    );
+
+    // Install something that depends on anyio
+    // We shouldn't overwrite our local version with the remote anyio here
+    uv_snapshot!(context.filters(), context.install()
+        .arg("httpx"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 7 packages in [TIME]
+    Downloaded 4 packages in [TIME]
+    Installed 4 packages in [TIME]
+     + certifi==2024.2.2
+     + h11==0.14.0
+     + httpcore==1.0.4
+     + httpx==0.27.0
+    "###
+    );
+}
+
+/// Install a package with multiple installed distributions in a virtual environment.
+#[test]
+#[cfg(unix)]
+fn already_installed_multiple_versions() -> Result<()> {
+    fn prepare(context: &TestContext) -> Result<()> {
+        use crate::common::copy_dir_all;
+
+        // Install into the base environment
+        context.install().arg("anyio==3.7.0").assert().success();
+
+        // Install another version into another environment
+        let context_duplicate = TestContext::new("3.12");
+        context_duplicate
+            .install()
+            .arg("anyio==4.0.0")
+            .assert()
+            .success();
+
+        // Copy the second version into the first environment
+        copy_dir_all(
+            context_duplicate
+                .site_packages()
+                .join("anyio-4.0.0.dist-info"),
+            context.site_packages().join("anyio-4.0.0.dist-info"),
+        )?;
+
+        Ok(())
+    }
+
+    let context = TestContext::new("3.12");
+
+    prepare(&context)?;
+
+    // Request the second anyio version again
+    // Should remove both previous versions and reinstall the second one
+    uv_snapshot!(context.filters(), context.install().arg("anyio==4.0.0"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     - anyio==3.7.0
+     - anyio==4.0.0
+     + anyio==4.0.0
+    "###
+    );
+
+    // Reset the test context
+    prepare(&context)?;
+
+    // Request the anyio without a version specifier
+    // This is loosely a regression test for the ordering of the installation preferences
+    // from existing site-packages
+    uv_snapshot!(context.filters(), context.install().arg("anyio"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    Installed 1 package in [TIME]
+     - anyio==3.7.0
+     - anyio==4.0.0
+     + anyio==4.0.0
+    "###
+    );
+
+    Ok(())
+}
+
+/// Install a package from a remote URL
+#[test]
+#[cfg(feature = "git")]
+fn already_installed_remote_url() {
+    let context = TestContext::new("3.8");
+
+    // First, install from the remote URL
+    uv_snapshot!(context.filters(), context.install().arg("uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage@0dacfd662c64cb4ceb16e6cf65a157a8b715b979)
+    "###);
+
+    context.assert_installed("uv_public_pypackage", "0.1.0");
+
+    // Request installation again with just the name
+    // We should just audit the URL package since it fulfills this requirement
+    uv_snapshot!(
+        context.install().arg("uv-public-pypackage"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Audited 1 package in [TIME]
+    "###);
+
+    // Request reinstallation
+    // We should fail since the URL was not provided
+    uv_snapshot!(
+        context.install()
+        .arg("uv-public-pypackage")
+        .arg("--no-index")
+        .arg("--reinstall"), @r###"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+      × No solution found when resolving dependencies:
+      ╰─▶ Because uv-public-pypackage was not found in the provided package locations and you require uv-public-pypackage, we can conclude that the requirements are unsatisfiable.
+
+          hint: Packages were unavailable because index lookups were disabled and no additional package locations were provided (try: `--find-links <uri>`)
+    "###);
+
+    // Request installation again with just the full URL
+    // We should just audit the existing package
+    uv_snapshot!(
+        context.install().arg("uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Audited 1 package in [TIME]
+    "###);
+
+    // Request reinstallation with the full URL
+    // We should reinstall successfully
+    uv_snapshot!(
+        context.install()
+        .arg("uv-public-pypackage @ git+https://github.com/astral-test/uv-public-pypackage")
+        .arg("--reinstall"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Installed 1 package in [TIME]
+     - uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage@0dacfd662c64cb4ceb16e6cf65a157a8b715b979)
+     + uv-public-pypackage==0.1.0 (from git+https://github.com/astral-test/uv-public-pypackage@0dacfd662c64cb4ceb16e6cf65a157a8b715b979)
+    "###);
+
+    // Request installation again with a different version
+    // We should attempt to pull from the index since the local version does not match
+    uv_snapshot!(
+        context.install().arg("uv-public-pypackage==0.2.0").arg("--no-index"), @r###"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    ----- stderr -----
+      × No solution found when resolving dependencies:
+      ╰─▶ Because uv-public-pypackage==0.2.0 was not found in the provided package locations and you require uv-public-pypackage==0.2.0, we can conclude that the requirements are unsatisfiable.
+
+          hint: Packages were unavailable because index lookups were disabled and no additional package locations were provided (try: `--find-links <uri>`)
+    "###);
+}
+
+/// Sync using `--find-links` with a local directory.
+#[test]
+fn find_links() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str(indoc! {r"
+        tqdm
+    "})?;
+
+    uv_snapshot!(context.filters(), context.install()
+        .arg("tqdm")
+        .arg("--find-links")
+        .arg(context.workspace_root.join("scripts/links/")), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + tqdm==1000.0.0
+    "###
+    );
+
+    Ok(())
+}
+
+/// Sync using `--find-links` with a local directory, with wheels disabled.
+#[test]
+fn find_links_no_binary() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str(indoc! {r"
+        tqdm
+    "})?;
+
+    uv_snapshot!(context.filters(), context.install()
+        .arg("tqdm")
+        .arg("--no-binary")
+        .arg(":all:")
+        .arg("--find-links")
+        .arg(context.workspace_root.join("scripts/links/")), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + tqdm==999.0.0
+    "###
+    );
+
+    Ok(())
+}
+
+/// Provide valid hashes for all dependencies with `--require-hashes`.
+#[test]
+fn require_hashes() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    // Write to a requirements file.
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str(indoc::indoc! {r"
+        anyio==4.0.0 \
+            --hash=sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f \
+            --hash=sha256:f7ed51751b2c2add651e5747c891b47e26d2a21be5d32d9311dfe9692f3e5d7a
+        idna==3.6 \
+            --hash=sha256:9ecdbbd083b06798ae1e86adcbfe8ab1479cf864e4ee30fe4e46a003d12491ca \
+            --hash=sha256:c05567e9c24a6b9faaa835c4821bad0590fbb9d5779e7caa6e1cc4978e7eb24f
+            # via anyio
+        sniffio==1.3.1 \
+            --hash=sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2 \
+            --hash=sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc
+            # via anyio
+    "})?;
+
+    uv_snapshot!(context.install()
+        .arg("-r")
+        .arg("requirements.txt")
+        .arg("--require-hashes"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    Downloaded 3 packages in [TIME]
+    Installed 3 packages in [TIME]
+     + anyio==4.0.0
+     + idna==3.6
+     + sniffio==1.3.1
+    "###
+    );
+
+    Ok(())
+}
+
+/// Omit hashes for dependencies with `--require-hashes`, which is allowed with `--no-deps`.
+#[test]
+fn require_hashes_no_deps() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    // Write to a requirements file.
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str(indoc::indoc! {r"
+        anyio==4.0.0 \
+            --hash=sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f \
+            --hash=sha256:f7ed51751b2c2add651e5747c891b47e26d2a21be5d32d9311dfe9692f3e5d7a
+    "})?;
+
+    uv_snapshot!(context.install()
+        .arg("-r")
+        .arg("requirements.txt")
+        .arg("--no-deps")
+        .arg("--require-hashes"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + anyio==4.0.0
+    "###
+    );
+
+    Ok(())
+}
+
+/// Provide the wrong hash with `--require-hashes`.
+#[test]
+fn require_hashes_mismatch() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    // Write to a requirements file.
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str(
+        "anyio==4.0.0 --hash=sha256:afdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f",
+    )?;
+
+    // Raise an error.
+    uv_snapshot!(context.install()
+        .arg("-r")
+        .arg("requirements.txt")
+        .arg("--require-hashes"), @r###"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: In `--require-hashes` mode, all requirements must be pinned upfront with `==`, but found: idna
+    "###
+    );
+
+    Ok(())
+}
+
+/// Omit a transitive dependency in `--require-hashes`.
+#[test]
+fn require_hashes_missing_dependency() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    // Write to a requirements file.
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str(
+        "anyio==4.0.0 --hash=sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f",
+    )?;
+
+    // Install without error when `--require-hashes` is omitted.
+    uv_snapshot!(context.install()
+        .arg("-r")
+        .arg("requirements.txt")
+        .arg("--require-hashes"), @r###"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: In `--require-hashes` mode, all requirements must be pinned upfront with `==`, but found: idna
+    "###
+    );
+
+    Ok(())
+}
+
+/// We disallow `--require-hashes` for editables' dependencies.
+#[test]
+fn require_hashes_editable() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str(&indoc::formatdoc! {r"
+        -e file://{workspace_root}/scripts/packages/black_editable[d]
+        ",
+        workspace_root = context.workspace_root.simplified_display(),
+    })?;
+
+    // Install the editable packages.
+    uv_snapshot!(context.filters(), context.install()
+        .arg("-r")
+        .arg(requirements_txt.path())
+        .arg("--require-hashes"), @r###"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    Built 1 editable in [TIME]
+    error: In `--require-hashes` mode, all requirements must be pinned upfront with `==`, but found: aiohttp
+    "###
+    );
+
+    Ok(())
+}
+
+/// If a hash is only included as a constraint, that's not good enough for `--require-hashes`.
+#[test]
+fn require_hashes_constraint() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    // Include the hash in the constraint file.
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str("anyio==4.0.0")?;
+
+    let constraints_txt = context.temp_dir.child("constraints.txt");
+    constraints_txt.write_str("anyio==4.0.0 --hash=sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f")?;
+
+    // Install the editable packages.
+    uv_snapshot!(context.install()
+        .arg("-r")
+        .arg(requirements_txt.path())
+        .arg("--require-hashes")
+        .arg("-c")
+        .arg(constraints_txt.path()), @r###"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: In `--require-hashes` mode, all requirement must have a hash, but none were provided for: anyio==4.0.0
+    "###
+    );
+
+    // Include the hash in the requirements file, but pin the version in the constraint file.
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str(
+        "anyio --hash=sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f",
+    )?;
+
+    let constraints_txt = context.temp_dir.child("constraints.txt");
+    constraints_txt.write_str("anyio==4.0.0")?;
+
+    // Install the editable packages.
+    uv_snapshot!(context.install()
+        .arg("-r")
+        .arg(requirements_txt.path())
+        .arg("--require-hashes")
+        .arg("-c")
+        .arg(constraints_txt.path()), @r###"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: In `--require-hashes` mode, all requirement must have their versions pinned with `==`, but found: anyio
+    "###
+    );
+
+    Ok(())
+}
+
+/// We allow `--require-hashes` for unnamed URL dependencies.
+#[test]
+fn require_hashes_unnamed() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt
+        .write_str(indoc::indoc! {r"
+            https://files.pythonhosted.org/packages/36/55/ad4de788d84a630656ece71059665e01ca793c04294c463fd84132f40fe6/anyio-4.0.0-py3-none-any.whl --hash=sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f
+            idna==3.6 \
+                --hash=sha256:9ecdbbd083b06798ae1e86adcbfe8ab1479cf864e4ee30fe4e46a003d12491ca \
+                --hash=sha256:c05567e9c24a6b9faaa835c4821bad0590fbb9d5779e7caa6e1cc4978e7eb24f
+                # via anyio
+            sniffio==1.3.1 \
+                --hash=sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2 \
+                --hash=sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc
+                # via anyio
+        "})?;
+
+    uv_snapshot!(context.install()
+        .arg("-r")
+        .arg("requirements.txt")
+        .arg("--require-hashes"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    Downloaded 3 packages in [TIME]
+    Installed 3 packages in [TIME]
+     + anyio==4.0.0 (from https://files.pythonhosted.org/packages/36/55/ad4de788d84a630656ece71059665e01ca793c04294c463fd84132f40fe6/anyio-4.0.0-py3-none-any.whl)
+     + idna==3.6
+     + sniffio==1.3.1
+    "###
+    );
+
+    Ok(())
+}
+
+/// We allow `--require-hashes` for unnamed URL dependencies. In this case, the unnamed URL is
+/// a repeat of a registered package.
+#[test]
+fn require_hashes_unnamed_repeated() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    // Re-run, but duplicate `anyio`.
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt
+        .write_str(indoc::indoc! {r"
+            anyio==4.0.0 \
+                --hash=sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f \
+                --hash=sha256:f7ed51751b2c2add651e5747c891b47e26d2a21be5d32d9311dfe9692f3e5d7a
+            https://files.pythonhosted.org/packages/36/55/ad4de788d84a630656ece71059665e01ca793c04294c463fd84132f40fe6/anyio-4.0.0-py3-none-any.whl --hash=sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f
+            idna==3.6 \
+                --hash=sha256:9ecdbbd083b06798ae1e86adcbfe8ab1479cf864e4ee30fe4e46a003d12491ca \
+                --hash=sha256:c05567e9c24a6b9faaa835c4821bad0590fbb9d5779e7caa6e1cc4978e7eb24f
+                # via anyio
+            sniffio==1.3.1 \
+                --hash=sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2 \
+                --hash=sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc
+                # via anyio
+        "} )?;
+
+    uv_snapshot!(context.install()
+        .arg("-r")
+        .arg("requirements.txt")
+        .arg("--require-hashes"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 3 packages in [TIME]
+    Downloaded 3 packages in [TIME]
+    Installed 3 packages in [TIME]
+     + anyio==4.0.0 (from https://files.pythonhosted.org/packages/36/55/ad4de788d84a630656ece71059665e01ca793c04294c463fd84132f40fe6/anyio-4.0.0-py3-none-any.whl)
+     + idna==3.6
+     + sniffio==1.3.1
+    "###
+    );
+
+    Ok(())
+}
+
+/// If a hash is only included as a override, that's not good enough for `--require-hashes`.
+///
+/// TODO(charlie): This _should_ be allowed. It's a bug.
+#[test]
+fn require_hashes_override() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    // Include the hash in the override file.
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str("anyio==4.0.0")?;
+
+    let overrides_txt = context.temp_dir.child("overrides.txt");
+    overrides_txt.write_str("anyio==4.0.0 --hash=sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f")?;
+
+    // Install the editable packages.
+    uv_snapshot!(context.install()
+        .arg("-r")
+        .arg(requirements_txt.path())
+        .arg("--require-hashes")
+        .arg("--override")
+        .arg(overrides_txt.path()), @r###"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: In `--require-hashes` mode, all requirement must have a hash, but none were provided for: anyio==4.0.0
+    "###
+    );
+
+    // Include the hash in the requirements file, but pin the version in the override file.
+    let requirements_txt = context.temp_dir.child("requirements.txt");
+    requirements_txt.write_str(
+        "anyio --hash=sha256:cfdb2b588b9fc25ede96d8db56ed50848b0b649dca3dd1df0b11f683bb9e0b5f",
+    )?;
+
+    let overrides_txt = context.temp_dir.child("overrides.txt");
+    overrides_txt.write_str("anyio==4.0.0")?;
+
+    // Install the editable packages.
+    uv_snapshot!(context.install()
+        .arg("-r")
+        .arg(requirements_txt.path())
+        .arg("--require-hashes")
+        .arg("--override")
+        .arg(overrides_txt.path()), @r###"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    error: In `--require-hashes` mode, all requirement must have their versions pinned with `==`, but found: anyio
+    "###
+    );
+
+    Ok(())
 }

@@ -49,7 +49,7 @@ impl GitSource {
     }
 
     /// Fetch the underlying Git repository at the given revision.
-    #[instrument(skip(self))]
+    #[instrument(skip(self), fields(repository = %self.git.repository, rev = ?self.git.precise))]
     pub fn fetch(self) -> Result<Fetch> {
         // The path to the repo, within the Git database.
         let ident = digest(&RepositoryUrl::new(&self.git.repository));
@@ -70,7 +70,7 @@ impl GitSource {
 
                 // Report the checkout operation to the reporter.
                 let task = self.reporter.as_ref().map(|reporter| {
-                    reporter.on_checkout_start(remote.url(), self.git.reference.as_str())
+                    reporter.on_checkout_start(remote.url(), self.git.reference.as_rev())
                 });
 
                 let (db, actual_rev) = remote.checkout(

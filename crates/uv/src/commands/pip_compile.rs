@@ -14,28 +14,31 @@ use owo_colors::OwoColorize;
 use tempfile::tempdir_in;
 use tracing::debug;
 
-use distribution_types::{IndexLocations, LocalEditable, Verbatim};
+use distribution_types::{IndexLocations, LocalEditable, LocalEditables, Verbatim};
 use platform_tags::Tags;
 use requirements_txt::EditableRequirement;
 use uv_auth::{KeyringProvider, GLOBAL_AUTH_STORE};
 use uv_cache::Cache;
-use uv_client::{
-    BaseClientBuilder, Connectivity, FlatIndex, FlatIndexClient, RegistryClientBuilder,
+use uv_client::{BaseClientBuilder, Connectivity, FlatIndexClient, RegistryClientBuilder};
+use uv_configuration::{
+    ConfigSettings, Constraints, IndexStrategy, NoBinary, NoBuild, Overrides, SetupPyStrategy,
+    Upgrade,
 };
 use uv_dispatch::BuildDispatch;
 use uv_fs::Simplified;
-use uv_installer::{Downloader, NoBinary};
-use uv_interpreter::{find_best_python, PythonEnvironment, PythonVersion};
+use uv_installer::Downloader;
+use uv_interpreter::{find_best_python, PythonEnvironment};
 use uv_normalize::{ExtraName, PackageName};
 use uv_requirements::{
     upgrade::read_lockfile, ExtrasSpecification, LookaheadResolver, NamedRequirementsResolver,
     RequirementsSource, RequirementsSpecification, SourceTreeResolver,
 };
 use uv_resolver::{
-    AnnotationStyle, DependencyMode, DisplayResolutionGraph, InMemoryIndex, Manifest,
-    OptionsBuilder, PreReleaseMode, PythonRequirement, ResolutionMode, Resolver,
+    AnnotationStyle, DependencyMode, DisplayResolutionGraph, Exclusions, FlatIndex, InMemoryIndex,
+    Manifest, OptionsBuilder, PreReleaseMode, PythonRequirement, ResolutionMode, Resolver,
 };
-use uv_types::{BuildIsolation, ConfigSettings, InFlight, NoBuild, SetupPyStrategy, Upgrade};
+use uv_toolchain::PythonVersion;
+use uv_types::{BuildIsolation, EmptyInstalledPackages, HashStrategy, InFlight};
 use uv_warnings::warn_user;
 
 use crate::commands::reporters::{DownloadReporter, ResolverReporter};
@@ -63,7 +66,9 @@ pub(crate) async fn pip_compile(
     include_index_url: bool,
     include_find_links: bool,
     include_marker_expression: bool,
+    include_index_annotation: bool,
     index_locations: IndexLocations,
+    index_strategy: IndexStrategy,
     keyring_provider: KeyringProvider,
     setup_py: SetupPyStrategy,
     config_settings: ConfigSettings,
@@ -184,6 +189,7 @@ pub(crate) async fn pip_compile(
             (python_version.major(), python_version.minor()),
             interpreter.implementation_name(),
             interpreter.implementation_tuple(),
+            interpreter.gil_disabled(),
         )?)
     } else {
         Cow::Borrowed(interpreter.tags()?)
@@ -192,6 +198,13 @@ pub(crate) async fn pip_compile(
         || Cow::Borrowed(interpreter.markers()),
         |python_version| Cow::Owned(python_version.markers(interpreter.markers())),
     );
+
+    // Generate, but don't enforce hashes for the requirements.
+    let hasher = if generate_hashes {
+        HashStrategy::Generate
+    } else {
+        HashStrategy::None
+    };
 
     // Incorporate any index locations from the provided sources.
     let index_locations =
@@ -207,6 +220,7 @@ pub(crate) async fn pip_compile(
         .native_tls(native_tls)
         .connectivity(connectivity)
         .index_urls(index_locations.index_urls())
+        .index_strategy(index_strategy)
         .keyring_provider(keyring_provider)
         .markers(&markers)
         .platform(interpreter.platform())
@@ -219,7 +233,7 @@ pub(crate) async fn pip_compile(
     let flat_index = {
         let client = FlatIndexClient::new(&client, &cache);
         let entries = client.fetch(index_locations.flat_index()).await?;
-        FlatIndex::from_entries(entries, &tags)
+        FlatIndex::from_entries(entries, &tags, &hasher, &no_build, &NoBinary::None)
     };
 
     // Track in-flight downloads, builds, etc., across resolutions.
@@ -256,45 +270,65 @@ pub(crate) async fn pip_compile(
     // Resolve the requirements from the provided sources.
     let requirements = {
         // Convert from unnamed to named requirements.
-        let mut requirements = NamedRequirementsResolver::new(requirements)
-            .with_reporter(ResolverReporter::from(printer))
-            .resolve(&build_dispatch, &client)
-            .await?;
+        let mut requirements = NamedRequirementsResolver::new(
+            requirements,
+            &hasher,
+            &build_dispatch,
+            &client,
+            &top_level_index,
+        )
+        .with_reporter(ResolverReporter::from(printer))
+        .resolve()
+        .await?;
 
         // Resolve any source trees into requirements.
         if !source_trees.is_empty() {
             requirements.extend(
-                SourceTreeResolver::new(source_trees, &extras)
-                    .with_reporter(ResolverReporter::from(printer))
-                    .resolve(&build_dispatch, &client)
-                    .await?,
+                SourceTreeResolver::new(
+                    source_trees,
+                    &extras,
+                    &hasher,
+                    &build_dispatch,
+                    &client,
+                    &top_level_index,
+                )
+                .with_reporter(ResolverReporter::from(printer))
+                .resolve()
+                .await?,
             );
         }
 
         requirements
     };
 
-    // Determine any lookahead requirements.
-    let lookaheads = LookaheadResolver::new(&requirements)
-        .with_reporter(ResolverReporter::from(printer))
-        .resolve(&build_dispatch, &client)
-        .await?;
+    // Resolve the overrides from the provided sources.
+    let overrides = NamedRequirementsResolver::new(
+        overrides,
+        &hasher,
+        &build_dispatch,
+        &client,
+        &top_level_index,
+    )
+    .with_reporter(ResolverReporter::from(printer))
+    .resolve()
+    .await?;
+
+    // Collect constraints and overrides.
+    let constraints = Constraints::from_requirements(constraints);
+    let overrides = Overrides::from_requirements(overrides);
 
     // Build the editables and add their requirements
-    let editable_metadata = if editables.is_empty() {
+    let editables = if editables.is_empty() {
         Vec::new()
     } else {
         let start = std::time::Instant::now();
 
-        let editables: Vec<LocalEditable> = editables
-            .into_iter()
-            .map(|editable| {
-                let EditableRequirement { url, extras, path } = editable;
-                Ok(LocalEditable { url, path, extras })
-            })
-            .collect::<Result<_>>()?;
+        let editables = LocalEditables::from_editables(editables.into_iter().map(|editable| {
+            let EditableRequirement { url, extras, path } = editable;
+            LocalEditable { url, path, extras }
+        }));
 
-        let downloader = Downloader::new(&cache, &tags, &client, &build_dispatch)
+        let downloader = Downloader::new(&cache, &tags, &hasher, &client, &build_dispatch)
             .with_reporter(DownloadReporter::from(printer).with_length(editables.len() as u64));
 
         // Build all editables.
@@ -336,6 +370,21 @@ pub(crate) async fn pip_compile(
         editables
     };
 
+    // Determine any lookahead requirements.
+    let lookaheads = LookaheadResolver::new(
+        &requirements,
+        &constraints,
+        &overrides,
+        &editables,
+        &hasher,
+        &build_dispatch,
+        &client,
+        &top_level_index,
+    )
+    .with_reporter(ResolverReporter::from(printer))
+    .resolve(&markers)
+    .await?;
+
     // Create a manifest of the requirements.
     let manifest = Manifest::new(
         requirements,
@@ -343,7 +392,9 @@ pub(crate) async fn pip_compile(
         overrides,
         preferences,
         project,
-        editable_metadata,
+        editables,
+        // Do not consider any installed packages during resolution.
+        Exclusions::All,
         lookaheads,
     );
 
@@ -364,7 +415,9 @@ pub(crate) async fn pip_compile(
         &client,
         &flat_index,
         &top_level_index,
+        &hasher,
         &build_dispatch,
+        &EmptyInstalledPackages,
     )?
     .with_reporter(ResolverReporter::from(printer));
 
@@ -472,6 +525,7 @@ pub(crate) async fn pip_compile(
             generate_hashes,
             include_extras,
             include_annotations,
+            include_index_annotation,
             annotation_style,
         )
     )?;

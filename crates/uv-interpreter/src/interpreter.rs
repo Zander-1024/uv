@@ -16,6 +16,7 @@ use platform_tags::{Tags, TagsError};
 use pypi_types::Scheme;
 use uv_cache::{Cache, CacheBucket, CachedByTimestamp, Freshness, Timestamp};
 use uv_fs::{write_atomic_sync, PythonExt, Simplified};
+use uv_toolchain::PythonVersion;
 
 use crate::Error;
 use crate::Virtualenv;
@@ -34,6 +35,7 @@ pub struct Interpreter {
     sys_executable: PathBuf,
     stdlib: PathBuf,
     tags: OnceCell<Tags>,
+    gil_disabled: bool,
 }
 
 impl Interpreter {
@@ -54,6 +56,7 @@ impl Interpreter {
             virtualenv: info.virtualenv,
             prefix: info.prefix,
             base_exec_prefix: info.base_exec_prefix,
+            gil_disabled: info.gil_disabled,
             base_prefix: info.base_prefix,
             base_executable: info.base_executable,
             sys_executable: info.sys_executable,
@@ -88,6 +91,7 @@ impl Interpreter {
             sys_executable: PathBuf::from("/dev/null"),
             stdlib: PathBuf::from("/dev/null"),
             tags: OnceCell::new(),
+            gil_disabled: false,
         }
     }
 
@@ -122,6 +126,7 @@ impl Interpreter {
                 self.python_tuple(),
                 self.implementation_name(),
                 self.implementation_tuple(),
+                self.gil_disabled,
             )
         })
     }
@@ -289,6 +294,15 @@ impl Interpreter {
         &self.virtualenv
     }
 
+    /// Return whether this is a Python 3.13+ freethreading Python, as specified by the sysconfig var
+    /// `Py_GIL_DISABLED`.
+    ///
+    /// freethreading Python is incompatible with earlier native modules, re-introducing
+    /// abiflags with a `t` flag. <https://peps.python.org/pep-0703/#build-configuration-changes>
+    pub fn gil_disabled(&self) -> bool {
+        self.gil_disabled
+    }
+
     /// Return the [`Layout`] environment used to install wheels into this interpreter.
     pub fn layout(&self) -> Layout {
         Layout {
@@ -312,6 +326,18 @@ impl Interpreter {
                     self.include().to_path_buf()
                 },
             },
+        }
+    }
+
+    /// Check if the interpreter matches the given Python version.
+    ///
+    /// If a patch version is present, we will require an exact match.
+    /// Otherwise, just the major and minor version numbers need to match.
+    pub fn satisfies(&self, version: &PythonVersion) -> bool {
+        if version.patch().is_some() {
+            version.version() == self.python_version()
+        } else {
+            (version.major(), version.minor()) == self.python_tuple()
         }
     }
 }
@@ -361,6 +387,7 @@ struct InterpreterInfo {
     base_executable: Option<PathBuf>,
     sys_executable: PathBuf,
     stdlib: PathBuf,
+    gil_disabled: bool,
 }
 
 impl InterpreterInfo {
@@ -461,12 +488,10 @@ impl InterpreterInfo {
     /// unless the Python executable changes, so we use the executable's last modified
     /// time as a cache key.
     pub(crate) fn query_cached(executable: &Path, cache: &Cache) -> Result<Self, Error> {
-        let executable_bytes = executable.as_os_str().as_encoded_bytes();
-
         let cache_entry = cache.entry(
             CacheBucket::Interpreter,
             "",
-            format!("{}.msgpack", digest(&executable_bytes)),
+            format!("{}.msgpack", digest(&executable)),
         );
 
         let modified = Timestamp::from_path(uv_fs::canonicalize_executable(executable)?)?;
@@ -590,7 +615,8 @@ mod tests {
                     "platlib": "lib/python3.12/site-packages",
                     "purelib": "lib/python3.12/site-packages",
                     "scripts": "bin"
-                }
+                },
+                "gil_disabled": true
             }
         "##};
 
